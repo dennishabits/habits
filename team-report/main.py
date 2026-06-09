@@ -4,25 +4,24 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import functions_framework
-from google.cloud import bigquery, firestore
+from google.cloud import bigquery, firestore, pubsub_v1
+from google import genai
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import vertexai
-from vertexai.generative_models import GenerativeModel
 
 # Configuration
 PROJECT_ID = os.environ.get("GCP_PROJECT", "solid-future-452906-a2")
 REGION = "europe-west1"
 REPORT_CHANNEL_ID = "C0B7NK3240K"
-DENNIS_SLACK_ID = "D1KPR28A0"
+DENNIS_SLACK_ID = "U158QLHEF"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 
 # Clients
 bq_client = bigquery.Client()
 firestore_client = firestore.Client()
+publisher_client = pubsub_v1.PublisherClient()
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 slack_clients = {}
-
-vertexai.init(project=PROJECT_ID, location=REGION)
 
 
 def log_json(label, data):
@@ -90,7 +89,7 @@ def query_task_performance(tenant_id, daypart, report_date):
       WHERE tenant_id = @tenant_id
         AND daypart = @daypart
         AND task_date BETWEEN DATE_SUB(@report_date, INTERVAL 28 DAY) AND DATE_SUB(@report_date, INTERVAL 1 DAY)
-        AND EXTRACT(DAYOFWEEK FROM task_date) = EXTRACT(DAYOFWEEK FROM DATE @report_date)
+        AND EXTRACT(DAYOFWEEK FROM task_date) = EXTRACT(DAYOFWEEK FROM @report_date)
         AND task_type NOT IN ('reboot', 'evaluation', 'subscription_change')
     )
     SELECT
@@ -178,7 +177,7 @@ def build_data_summary(tasks, appointments, daypart, report_date):
     # Task totals
     total_tasks = sum(t['total'] for t in tasks)
     total_completed = sum(t['completed_count'] for t in tasks)
-    total_expired = sum(t['expired_count'] for t in tasks)
+    total_expired = sum(t['total'] - t['completed_count'] for t in tasks)
     benchmark = tasks[0]['benchmark_completion_rate'] if tasks else None
     overall_rate = round(total_completed / total_tasks * 100) if total_tasks > 0 else 0
 
@@ -194,7 +193,7 @@ def build_data_summary(tasks, appointments, daypart, report_date):
             "task_type": t['task_type'],
             "total": t['total'],
             "completed": t['completed_count'],
-            "expired": t['expired_count'],
+            "expired": t['total'] - t['completed_count'],
             "completion_rate": t['completion_rate'],
             "avg_response_time_minutes": t['avg_response_time']
         })
@@ -221,14 +220,37 @@ def build_data_summary(tasks, appointments, daypart, report_date):
             entry['followup_applicable'] = a['followup_applicable']
         summary['appointments'].append(entry)
 
+    task_by_type = {t['task_type']: t for t in tasks}
+
+    def cat(types):
+        total = sum(task_by_type[tt]['total'] for tt in types if tt in task_by_type)
+        completed = sum(task_by_type[tt]['completed_count'] for tt in types if tt in task_by_type)
+        return {"completed": completed, "total": total}
+
+    summary['task_categories'] = {
+        "bezoekerstaken": cat(['member_talk']),
+        "afspraaktaken": {"completed": total_followup_scheduled, "total": total_followup_applicable},
+        "crm_taken": cat(['member_call']),
+        "sales_taken": cat(['prospect_call']),
+    }
+
     return summary
 
 
+def publish_error(error_description, context=None):
+    try:
+        payload = {"email": "dennis@habits.fit", "type": "error", "service": "team-report", "error": error_description}
+        if context:
+            payload["context"] = context
+        topic_path = publisher_client.topic_path(PROJECT_ID, "events")
+        publisher_client.publish(topic_path, json.dumps(payload, default=str).encode())
+    except Exception as e:
+        print(f"❌ Failed to publish error to events: {e}")
+
+
 def call_gemini(prompt, data_summary):
-    """Call Gemini with the prompt and data summary."""
-    model = GenerativeModel("gemini-2.0-flash-lite")
     full_prompt = f"{prompt}\n\nData:\n{json.dumps(data_summary, ensure_ascii=False, indent=2)}"
-    response = model.generate_content(full_prompt)
+    response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt)
     return response.text
 
 
@@ -318,10 +340,12 @@ def team_report(cloud_event):
         import traceback
         print(f"❌ Error: {e}")
         print(f"🐛 {traceback.format_exc()}")
+        context = {"daypart": envelope.get('daypart')} if 'envelope' in dir() else {}
+        publish_error(str(e), context=context)
         try:
             client = get_slack_client(envelope.get('tenant_id', ''))
             if client:
-                notify_dennis(client, str(e), context={"daypart": envelope.get('daypart')})
+                notify_dennis(client, str(e), context=context)
         except:
             pass
         raise
