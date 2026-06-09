@@ -1,0 +1,4 @@
+google-cloud-pubsub==2.18.4
+google-cloud-bigquery==3.11.4
+google-cloud-firestore==2.11.1
+requests==2.31.0

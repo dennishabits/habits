@@ -1,0 +1,14 @@
+name: fetch-memberships
+description: Fetch memberships from Sportivity and store in BigQuery
+entryPoint: fetch_memberships
+runtime: python310
+serviceAccountEmail: YOUR_SERVICE_ACCOUNT@gcp-project.iam.gserviceaccount.com
+sourceDirectory: .
+trigger:
+  type: http
+  ingressSettings: allowAll
+  securityLevel: secureAlways
+environment: gen2
+region: europe-west1
+timeoutSeconds: 540
+availableMemoryMb: 512

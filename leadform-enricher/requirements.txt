@@ -1,0 +1,4 @@
+
+google-cloud-pubsub==2.23.0
+google-cloud-bigquery==3.13.0
+tenacity==8.2.3

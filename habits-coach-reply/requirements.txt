@@ -1,0 +1,11 @@
+functions-framework==3.*
+google-cloud-bigquery
+google-cloud-firestore
+google-cloud-pubsub
+google-genai
+requests
+pandas
+numpy
+scipy
+statsmodels
+gower

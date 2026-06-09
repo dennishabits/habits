@@ -1,0 +1,150 @@
+import logging
+from datetime import datetime
+from typing import Dict, Any
+import json
+from google.cloud import bigquery
+from google.cloud import pubsub_v1
+from google.cloud import firestore
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SportivityRefresherService:
+    def __init__(self, config: Dict[str, Any]):
+        logger.info(f"Initializing with config: {config}")
+        self.config = config
+        self.project_id = config['project_id']
+        self.dataset_id = config['dataset_id']
+        
+        # Initialize BigQuery client
+        try:
+            self.bq_client = bigquery.Client(project=self.project_id)
+            self.refresh_queue_table = f"{self.project_id}.{self.dataset_id}.refresh_queue"
+            logger.info("BigQuery client initialized")
+        except Exception as e:
+            logger.error(f"BigQuery init failed: {e}")
+            raise
+        
+        # Initialize Pub/Sub client
+        try:
+            self.publisher = pubsub_v1.PublisherClient()
+            self.enricher_topic_path = self.publisher.topic_path(self.project_id, 'enricher')
+            logger.info("Pub/Sub client initialized")
+        except Exception as e:
+            logger.error(f"Pub/Sub init failed: {e}")
+            raise
+        
+        # Initialize Firestore client
+        try:
+            self.firestore_client = firestore.Client()
+            logger.info("Firestore client initialized")
+        except Exception as e:
+            logger.error(f"Firestore init failed: {e}")
+            raise
+        
+        logger.info("Service initialized successfully")
+    
+    def handle_event(self, event_data: Dict[str, Any]):
+        """Handle incoming event"""
+        logger.info(f"Handling event: {event_data}")
+        
+        customer_id = event_data.get('customer_id')
+        event_type = event_data.get('event_type')
+        
+        if not customer_id or not event_type:
+            logger.error("Missing customer_id or event_type")
+            return
+        
+        # Queue customer
+        if self.queue_customer(customer_id, event_type):
+            # Publish to enricher
+            self.publish_to_enricher(customer_id)
+    
+    def queue_customer(self, customer_id: str, event_type: str) -> bool:
+        """Queue customer in BigQuery"""
+        logger.info(f"Queueing customer {customer_id} for {event_type}")
+        
+        try:
+            today = datetime.now().date()
+            
+            insert_query = f"""
+            INSERT INTO `{self.refresh_queue_table}`
+            (customer_id, trigger_reason, queued_date, queued_timestamp, status, retry_count)
+            VALUES (@customer_id, @trigger_reason, @queued_date, @queued_timestamp, 'completed', 0)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("customer_id", "STRING", customer_id),
+                    bigquery.ScalarQueryParameter("trigger_reason", "STRING", event_type),
+                    bigquery.ScalarQueryParameter("queued_date", "DATE", today),
+                    bigquery.ScalarQueryParameter("queued_timestamp", "TIMESTAMP", datetime.now()),
+                ]
+            )
+            
+            self.bq_client.query(insert_query, job_config=job_config)
+            logger.info(f"Successfully queued customer {customer_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error queueing customer {customer_id}: {e}")
+            return False
+    
+    def publish_to_enricher(self, customer_id: str):
+        """Publish to enricher topic"""
+        logger.info(f"Publishing to enricher for customer {customer_id}")
+        
+        try:
+            # Get token from Firestore
+            doc_ref = self.firestore_client.collection('config').document('api_tokens')
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                token = doc.to_dict().get('sportivityToken')
+                if token:
+                    # Create enricher event
+                    enricher_event = {
+                        "token": token,
+                        "type": "CustomersRefresh", 
+                        "CustomerId": int(customer_id) if customer_id.isdigit() else customer_id
+                    }
+                    
+                    # Publish
+                    message_data = json.dumps(enricher_event).encode('utf-8')
+                    future = self.publisher.publish(self.enricher_topic_path, message_data)
+                    message_id = future.result()
+                    
+                    logger.info(f"Published to enricher: {message_id}")
+                else:
+                    logger.error("No sportivityToken found")
+            else:
+                logger.error("api_tokens document not found")
+                
+        except Exception as e:
+            logger.error(f"Error publishing to enricher: {e}")
+    
+    def get_queue_status(self) -> Dict[str, Any]:
+        """Get queue status"""
+        try:
+            query = f"""
+            SELECT status, COUNT(*) as count
+            FROM `{self.refresh_queue_table}`
+            WHERE queued_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+            GROUP BY status
+            """
+            
+            results = list(self.bq_client.query(query))
+            
+            status_counts = {}
+            for row in results:
+                status_counts[row.status] = row.count
+            
+            return {
+                "queue_status": status_counts,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting queue status: {e}")
+            return {"error": str(e)}

@@ -1,0 +1,4 @@
+google-cloud-firestore
+slack-sdk
+functions-framework
+cloudevents
