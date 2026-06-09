@@ -49,7 +49,6 @@ De agent stelt voor, legt uit, en wacht op expliciete bevestiging ("ja", "deploy
 
 - `gcloud functions deploy` wordt uitgevoerd
 - `gcloud pubsub topics publish` wordt uitgevoerd voor testen
-- Bestanden worden gecommit en gepusht naar GitHub
 
 ### Altijd escaleren naar Dennis
 
@@ -77,6 +76,8 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 5. Schrijf de fix met uitleg
 6. Presenteer het deployment command — wacht op goedkeuring
 7. Na goedkeuring: deploy en verifieer via logs
+8. Na succesvolle verificatie: commit en push naar GitHub met een beschrijvende commit message
+9. Nooit pushen zonder succesvolle verificatie — GitHub is de source of truth voor wat werkt
 
 ### Bij een nieuwe feature
 
@@ -86,6 +87,9 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 4. Volg de scheiding: enrichment ≠ translation ≠ listening
 5. Volg de logging-standaard: INPUT → ENRICHMENT_{SOURCE}_{TYPE} → TO_{TOPIC}
 6. Schrijf complete, deploybare code — geen snippets
+7. Presenteer het deployment command — wacht op goedkeuring
+8. Na goedkeuring: deploy en verifieer via logs
+9. Na succesvolle verificatie: commit en push naar GitHub met een beschrijvende commit message
 
 ### Bij een onduidelijke taak
 
