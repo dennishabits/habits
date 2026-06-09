@@ -41,7 +41,8 @@ Een agent mag het volgende doen zonder voorafgaande goedkeuring:
 - Deployment commands voorbereiden en presenteren
 - Logs lezen en interpreteren
 - BigQuery views en queries analyseren
-- Firestore-structuur inspecteren (read-only)
+- Firestore `config` collectie lezen en schrijven (prompts, thresholds)
+- Firestore-structuur inspecteren (read-only, alleen `config`)
 
 ### Goedkeuring vereist
 
@@ -57,6 +58,7 @@ De agent voert deze acties nooit uit, ook niet na goedkeuring op andere punten:
 - Aanmaken of verwijderen van Pub/Sub topics
 - Aanmaken of verwijderen van Cloud Scheduler jobs
 - Wijzigingen aan Firestore-schema of collectiestructuur
+- Lezen uit `tenants`, `slack_messages`, `coaching_sessions`, `session_locks` — deze collecties bevatten PII en tokens
 - Toevoegen of wijzigen van secrets of environment variables
 - Wijzigingen die meerdere services tegelijk raken
 - Aanmaken van nieuwe GCP resources (buckets, datasets, etc.)
