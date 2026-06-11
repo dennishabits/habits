@@ -114,6 +114,18 @@ def slack_post(token: str, channel: str, text: str, thread_ts: str = None) -> di
     return response.json()
 
 
+def slack_chat_update(token: str, channel: str, ts: str, text: str) -> dict:
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
+    response = session.post(
+        "https://slack.com/api/chat.update",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"channel": channel, "ts": ts, "text": text, "mrkdwn": True},
+        timeout=10
+    )
+    return response.json()
+
+
 def slack_dm_dennis(token: str, dennis_user_id: str, text: str) -> dict:
     return slack_post(token=token, channel=dennis_user_id, text=text)
 
@@ -176,6 +188,32 @@ def append_to_session_conversation(doc_id: str, role: str, content: str):
         "conversation": firestore.ArrayUnion([entry]),
         "updated_at": datetime.now(timezone.utc).isoformat()
     })
+
+
+def complete_task(task_doc_id: str, task_data: dict, slack_token: str):
+    task_action = task_data.get("task_action", "")
+    visitor_name = task_data.get("visitor_name", "Bezoeker")
+    label = f"{task_action} ingepland" if task_action else "Taak voltooid"
+
+    task_doc_ref = fs_client.collection("slack_messages").document(task_doc_id)
+
+    if not task_data.get("visible", True):
+        task_doc_ref.update({"completed": True, "expired": False, "completed_at": firestore.SERVER_TIMESTAMP})
+        log({"TO_FIRESTORE_TASK_COMPLETED": {"doc_id": task_doc_id, "visible": False}})
+        return
+
+    message_ts = task_data.get("message_ts")
+    channel = task_data.get("channel")
+
+    if message_ts and channel:
+        result = slack_chat_update(
+            token=slack_token, channel=channel, ts=message_ts,
+            text=f"✅ ~{visitor_name}~ • {label}"
+        )
+        log({"TO_SLACK_CHAT_UPDATE": {"doc_id": task_doc_id, "ok": result.get("ok"), "label": label}})
+
+    task_doc_ref.update({"completed": True, "expired": False, "completed_at": firestore.SERVER_TIMESTAMP})
+    log({"TO_FIRESTORE_TASK_COMPLETED": {"doc_id": task_doc_id, "visitor_name": visitor_name, "label": label}})
 
 
 def write_error_log(doc_id: str, data: dict):
@@ -571,9 +609,14 @@ def handle_task_investigation(
     resolution = None
     approved_by = None
 
-    if resolution_possible and not needs_dennis and resolution_method == "pipeline_event":
-        publish_correction_event(tenant_id, task_data, task_doc_id)
-        resolution = "Correctie-event gepubliceerd via pipeline"
+    if resolution_possible and not needs_dennis and resolution_method in ("pipeline_event", "firestore_direct"):
+        if resolution_method == "pipeline_event":
+            publish_correction_event(tenant_id, task_data, task_doc_id)
+            resolution = "Correctie-event gepubliceerd via pipeline + taak voltooid"
+        else:
+            resolution = "Taak direct voltooid"
+
+        complete_task(task_doc_id, task_data, slack_token)
         approved_by = "agent"
 
         confirmation_text = "De taak is nu correct verwerkt — klopt dit?"
