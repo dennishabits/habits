@@ -12,6 +12,7 @@ publisher = pubsub_v1.PublisherClient()
 
 PROJECT_ID = "solid-future-452906-a2"
 HABITS_COACH_REPLY_URL = os.environ.get("HABITS_COACH_REPLY_URL", "")
+SLACK_AGENT_URL = os.environ.get("SLACK_AGENT_URL", "")
 
 
 def log(data: dict):
@@ -40,13 +41,13 @@ def publish_error_event(error_description: str):
         log({"PUBLISH_ERROR_FAILED": str(e)})
 
 
-def get_coaching_channel_for_team(slack_team_id: str) -> str | None:
+def get_tenant_by_team_id(slack_team_id: str) -> dict | None:
     docs = fs_client.collection("tenants") \
         .where(filter=firestore.FieldFilter("slack_team_id", "==", slack_team_id)) \
         .limit(1) \
         .stream()
     for doc in docs:
-        return doc.to_dict().get("slack_coach_channel")
+        return doc.to_dict()
     return None
 
 
@@ -100,52 +101,70 @@ def coaching_listener(cloud_event):
             log({"SKIPPED": {"reason": "no team_id in payload"}})
             return "OK"
 
-        coaching_channel = get_coaching_channel_for_team(slack_team_id)
-        if not coaching_channel:
-            log({"SKIPPED": {"reason": "no coaching channel configured", "team_id": slack_team_id}})
+        tenant = get_tenant_by_team_id(slack_team_id)
+        if not tenant:
+            log({"SKIPPED": {"reason": "tenant not found", "team_id": slack_team_id}})
             return "OK"
 
         message_channel = event.get("channel")
-        if message_channel != coaching_channel:
+        coaching_channel = tenant.get("slack_coach_channel")
+        agent_channels = {ch["channel_id"] for ch in tenant.get("slack_agent_channels", []) if ch.get("channel_id")}
+
+        if message_channel != coaching_channel and message_channel not in agent_channels:
             log({"SKIPPED": {
-                "reason": "not in coaching channel",
+                "reason": "not in a monitored channel",
                 "message_channel": message_channel,
-                "coaching_channel": coaching_channel
             }})
             return "OK"
 
-        log({"COACHING_MESSAGE_DETECTED": {
-            "team_id": slack_team_id,
-            "channel": message_channel,
-            "is_start_trigger": is_start_trigger,
-            "message_preview": event.get("text", "")[:100]
-        }})
-
-        if not HABITS_COACH_REPLY_URL:
-            raise ValueError("HABITS_COACH_REPLY_URL environment variable not set")
-
-        # Fire and forget — don't wait for reply to finish
-        # Reply takes 20-30s; waiting causes Pub/Sub retries and duplicate processing
-        try:
-            requests.post(
-                HABITS_COACH_REPLY_URL,
-                json=payload,
-                timeout=5
-            )
-            log({"TO_HABITS_COACH_REPLY": {
-                "url": HABITS_COACH_REPLY_URL,
+        if message_channel == coaching_channel:
+            log({"COACHING_MESSAGE_DETECTED": {
+                "team_id": slack_team_id,
+                "channel": message_channel,
                 "is_start_trigger": is_start_trigger,
-                "status": "fired"
+                "message_preview": event.get("text", "")[:100]
             }})
-        except requests.exceptions.Timeout:
-            log({"TO_HABITS_COACH_REPLY": {
-                "url": HABITS_COACH_REPLY_URL,
-                "is_start_trigger": is_start_trigger,
-                "status": "timeout_expected"
+
+            if not HABITS_COACH_REPLY_URL:
+                raise ValueError("HABITS_COACH_REPLY_URL environment variable not set")
+
+            # Fire and forget — don't wait for reply to finish
+            # Reply takes 20-30s; waiting causes Pub/Sub retries and duplicate processing
+            try:
+                requests.post(HABITS_COACH_REPLY_URL, json=payload, timeout=5)
+                log({"TO_HABITS_COACH_REPLY": {
+                    "url": HABITS_COACH_REPLY_URL,
+                    "is_start_trigger": is_start_trigger,
+                    "status": "fired"
+                }})
+            except requests.exceptions.Timeout:
+                log({"TO_HABITS_COACH_REPLY": {
+                    "url": HABITS_COACH_REPLY_URL,
+                    "is_start_trigger": is_start_trigger,
+                    "status": "timeout_expected"
+                }})
+            except Exception as e:
+                log({"TO_HABITS_COACH_REPLY_ERROR": {"error": str(e)}})
+                publish_error_event(f"Failed to call habits-coach-reply: {str(e)}")
+
+        if message_channel in agent_channels:
+            log({"AGENT_MESSAGE_DETECTED": {
+                "team_id": slack_team_id,
+                "channel": message_channel,
+                "message_preview": event.get("text", "")[:100]
             }})
-        except Exception as e:
-            log({"TO_HABITS_COACH_REPLY_ERROR": {"error": str(e)}})
-            publish_error_event(f"Failed to call habits-coach-reply: {str(e)}")
+
+            if not SLACK_AGENT_URL:
+                raise ValueError("SLACK_AGENT_URL environment variable not set")
+
+            try:
+                requests.post(SLACK_AGENT_URL, json=payload, timeout=5)
+                log({"TO_SLACK_AGENT": {"url": SLACK_AGENT_URL, "status": "fired"}})
+            except requests.exceptions.Timeout:
+                log({"TO_SLACK_AGENT": {"url": SLACK_AGENT_URL, "status": "timeout_expected"}})
+            except Exception as e:
+                log({"TO_SLACK_AGENT_ERROR": {"error": str(e)}})
+                publish_error_event(f"Failed to call slack-agent: {str(e)}")
 
         return "OK"
 
