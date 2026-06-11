@@ -78,71 +78,51 @@ def normalize_phone(phone):
 
 
 def lookup_customer_in_bigquery(email, phone, tenant_id):
-    """Lookup customer in BigQuery by email first, phone as fallback"""
+    """Lookup customer in BigQuery by email/phone"""
     try:
-        # Step 1: Try email-only lookup if email is present
+        # Build query parameters
+        query_params = [
+            bigquery.ScalarQueryParameter("tenant_id", "STRING", tenant_id),
+        ]
+        
+        conditions = []
+        
+        # Add email condition
         if email and email.strip():
-            query = f"""
-            SELECT customer_id, email
-            FROM `{PROJECT_ID}.gym_analytics.customers`
-            WHERE tenant_id = @tenant_id
-              AND email = @email
-              AND customer_id IS NOT NULL
-            ORDER BY
-              CASE WHEN subscription_active = TRUE THEN 1 ELSE 2 END,
-              member_since ASC
-            LIMIT 1
-            """
-            job_config = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("tenant_id", "STRING", tenant_id),
-                bigquery.ScalarQueryParameter("email", "STRING", email.strip().lower()),
-            ])
-            results = bigquery_client.query(query, job_config=job_config).result()
-            for row in results:
-                log_json("ENRICHMENT_BIGQUERY_LOOKUP", {
-                    "lookup_method": "email",
-                    "customer_found": True,
-                    "customer_id": row.customer_id,
-                    "email_from_bigquery": None
-                })
-                return {"customer_id": row.customer_id, "email": row.email}
-
-        # Step 2: Fall back to phone-only lookup if no email match
+            conditions.append("email = @email")
+            query_params.append(bigquery.ScalarQueryParameter("email", "STRING", email.strip().lower()))
+        
+        # Add phone condition
         clean_phone = normalize_phone(phone)
         if clean_phone:
-            query = f"""
-            SELECT customer_id, email
-            FROM `{PROJECT_ID}.gym_analytics.customers`
-            WHERE tenant_id = @tenant_id
-              AND REGEXP_REPLACE(phone_number, r'[^0-9]', '') = @clean_phone
-              AND customer_id IS NOT NULL
-            ORDER BY
-              CASE WHEN subscription_active = TRUE THEN 1 ELSE 2 END,
-              member_since ASC
-            LIMIT 1
-            """
-            job_config = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("tenant_id", "STRING", tenant_id),
-                bigquery.ScalarQueryParameter("clean_phone", "STRING", clean_phone),
-            ])
-            results = bigquery_client.query(query, job_config=job_config).result()
-            for row in results:
-                log_json("ENRICHMENT_BIGQUERY_LOOKUP", {
-                    "lookup_method": "phone_fallback",
-                    "customer_found": True,
-                    "customer_id": row.customer_id,
-                    "email_from_bigquery": row.email
-                })
-                return {"customer_id": row.customer_id, "email": row.email}
-
-        log_json("ENRICHMENT_BIGQUERY_LOOKUP", {
-            "lookup_method": "no_match",
-            "customer_found": False,
-            "customer_id": None,
-            "email_from_bigquery": None
-        })
+            conditions.append("REGEXP_REPLACE(phone_number, r'[^0-9]', '') = @clean_phone")
+            query_params.append(bigquery.ScalarQueryParameter("clean_phone", "STRING", clean_phone))
+        
+        if not conditions:
+            return None
+        
+        # Build query
+        where_clause = " OR ".join(conditions)
+        query = f"""
+        SELECT customer_id, email
+        FROM `{PROJECT_ID}.gym_analytics.customers` 
+        WHERE tenant_id = @tenant_id AND ({where_clause})
+        LIMIT 1
+        """
+        
+        # Execute query
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        query_job = bigquery_client.query(query, job_config=job_config)
+        results = query_job.result()
+        
+        for row in results:
+            return {
+                "customer_id": row.customer_id,
+                "email": row.email
+            }
+        
         return None
-
+        
     except Exception as e:
         print(f"❌ BigQuery error: {e}")
         raise
