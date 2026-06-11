@@ -41,8 +41,7 @@ Een agent mag het volgende doen zonder voorafgaande goedkeuring:
 - Deployment commands voorbereiden en presenteren
 - Logs lezen en interpreteren
 - BigQuery views en queries analyseren
-- Firestore `config` collectie lezen en schrijven (prompts, thresholds)
-- Firestore-structuur inspecteren (read-only, alleen `config`)
+- Firestore-structuur inspecteren (read-only)
 
 ### Goedkeuring vereist
 
@@ -50,6 +49,9 @@ De agent stelt voor, legt uit, en wacht op expliciete bevestiging ("ja", "deploy
 
 - `gcloud functions deploy` wordt uitgevoerd
 - `gcloud pubsub topics publish` wordt uitgevoerd voor testen
+- Bestanden worden gecommit en gepusht naar GitHub
+- Een Firestore taakdocument direct wordt bijgewerkt buiten de normale pipeline
+- Een correctie-event wordt gepubliceerd om een taak alsnog te voltooien
 
 ### Altijd escaleren naar Dennis
 
@@ -58,10 +60,10 @@ De agent voert deze acties nooit uit, ook niet na goedkeuring op andere punten:
 - Aanmaken of verwijderen van Pub/Sub topics
 - Aanmaken of verwijderen van Cloud Scheduler jobs
 - Wijzigingen aan Firestore-schema of collectiestructuur
-- Lezen uit `tenants`, `slack_messages`, `coaching_sessions`, `session_locks` — deze collecties bevatten PII en tokens
 - Toevoegen of wijzigen van secrets of environment variables
 - Wijzigingen die meerdere services tegelijk raken
 - Aanmaken van nieuwe GCP resources (buckets, datasets, etc.)
+- Acties in externe systemen met destructief effect (Customer.io merge, Acuity e-mailadres wijzigen)
 
 Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde infra-wijziging vaak niet.
 
@@ -78,8 +80,6 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 5. Schrijf de fix met uitleg
 6. Presenteer het deployment command — wacht op goedkeuring
 7. Na goedkeuring: deploy en verifieer via logs
-8. Na succesvolle verificatie: commit en push naar GitHub met een beschrijvende commit message
-9. Nooit pushen zonder succesvolle verificatie — GitHub is de source of truth voor wat werkt
 
 ### Bij een nieuwe feature
 
@@ -89,13 +89,107 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 4. Volg de scheiding: enrichment ≠ translation ≠ listening
 5. Volg de logging-standaard: INPUT → ENRICHMENT_{SOURCE}_{TYPE} → TO_{TOPIC}
 6. Schrijf complete, deploybare code — geen snippets
-7. Presenteer het deployment command — wacht op goedkeuring
-8. Na goedkeuring: deploy en verifieer via logs
-9. Na succesvolle verificatie: commit en push naar GitHub met een beschrijvende commit message
 
 ### Bij een onduidelijke taak
 
 Stel één gerichte vraag. Niet meerdere vragen tegelijk. Niet gokken en hopen.
+
+---
+
+## Foutafhandeling via slack-agent
+
+De `slack-agent` handelt discrepanties in taakverwerking af via de Slack-thread van de betreffende taak. Dit proces volgt vaste regels.
+
+### Triggerherkenning
+
+Niet elk bericht in een taak-thread is een systeemfout. De agent onderscheidt:
+
+- **Discrepantiesignaal** — medewerker geeft aan dat een taak gedaan is maar niet als voltooid staat, of dat iets niet klopt → onderzoek starten
+- **Operationele opmerking** — medewerker meldt iets over de uitvoering ("hij nam niet op") → registreren, niet onderzoeken
+- **Onduidelijk** → de agent stelt één gerichte vraag terug: "Bedoel je dat de taak al gedaan is maar nog openstaat?"
+
+### Onderzoeksproces
+
+Het onderzoek is gelaagd. De agent stopt zodra de root cause gevonden is.
+
+1. **Firestore** — taakstate, action_type, customer_id, email, created_at, expired, completed
+2. **BigQuery** — events rondom die taak in het relevante tijdvenster (completion events, expiry events)
+3. **GCS logs** — alleen als stap 1 en 2 geen antwoord geven
+4. **Bronsysteem** (Acuity, Sportivity, Customer.io) — alleen bij datakwaliteitsproblemen
+
+De agent raadpleegt Firestore (`tenants/{tenant_id}`) om te bepalen welke externe systemen actief zijn voor deze tenant voordat hij bronsystemen benadert.
+
+### Herstelproces
+
+Herstel verloopt altijd via de normale pipeline — niet via directe Firestore-schrijfacties.
+
+**Voorkeursvolgorde:**
+1. Publiceer het correcte completion-event via het `events` topic — dit test tegelijk of de pipeline correct werkt
+2. Alleen als de pipeline zelf het probleem is: directe Firestore-update, na akkoord van Dennis
+
+Systeemwijzigingen (code, deployment) vereisen altijd akkoord van Dennis via het normale escalatiepad.
+Acties in externe systemen (Acuity e-mailadres, Customer.io merge) vereisen altijd akkoord van Dennis.
+
+### Communicatie richting medewerker
+
+De medewerker ziet geen technische details. De agent communiceert in drie stappen:
+
+1. **Tijdens onderzoek**: "We kijken wat er is misgegaan."
+2. **Na diagnose**: één zin wat er is misgegaan, in begrijpelijke taal.
+3. **Na herstel**: "De taak is nu correct verwerkt — klopt dit?"
+
+Geen jargon, geen excuses, geen architectuuruitleg.
+
+### Escalatie bij vastlopen
+
+Als na twee onderzoeksstappen de root cause niet gevonden is, escaleert de agent naar Dennis met:
+
+```
+⚠️ Escalatie foutonderzoek
+Taak: [doc_id]
+Signaal: [wat de medewerker meldde]
+Onderzocht: [wat is bekeken]
+Gevonden: [wat is gevonden]
+Ontbreekt: [waarom de oorzaak nog onduidelijk is]
+```
+
+### Regels
+
+1. **Eén probleem tegelijk** — één discrepantie per thread, geen cross-taak conclusies
+2. **Gelaagd onderzoek** — stop zodra de root cause bekend is
+3. **Diagnose en herstel zijn gescheiden** — diagnose is autonoom, herstel vereist akkoord
+4. **Herstel via de pipeline** — niet via shortcuts, tenzij de pipeline zelf het probleem is
+5. **Elke actie is herleidbaar** — alles wordt gelogd in de Firestore foutlog
+6. **Escaleer bij vastlopen** — na twee stappen zonder antwoord, niet verder zonder menselijke input
+7. **Twijfel? Vraag terug** — één gerichte vraag, nooit aannames
+
+---
+
+## Firestore foutlog
+
+Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en auditing.
+
+### Schema
+
+| Veld | Type | Inhoud |
+|---|---|---|
+| `tenant_id` | string | Tenant waar de fout optrad |
+| `task_doc_id` | string | Firestore doc_id van de betreffende taak |
+| `signal` | string | Wat de medewerker meldde |
+| `signal_type` | string | `discrepancy`, `operational`, `unclear` |
+| `investigation_steps` | array | Welke bronnen zijn geraadpleegd in volgorde |
+| `root_cause` | string | Vastgestelde oorzaak |
+| `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `unknown` |
+| `resolution` | string | Welke actie is uitgevoerd |
+| `resolution_method` | string | `pipeline_event`, `firestore_direct`, `external_system`, `escalated` |
+| `approved_by` | string | `agent` (autonoom) of `dennis` (na akkoord) |
+| `employee_confirmed` | boolean | Heeft de medewerker bevestigd dat het klopt |
+| `created_at` | timestamp | Moment van signaal |
+| `resolved_at` | timestamp | Moment van afsluiting |
+
+### Gebruik
+
+De foutlog is de primaire bron voor patroonherkenning. Periodiek worden terugkerende `root_cause_category` waarden geanalyseerd om structurele fixes te prioriteren.
 
 ---
 
@@ -153,6 +247,8 @@ gcloud functions logs read [naam] \
 - Meerdere vragen tegelijk stellen
 - Een fix deployen zonder goedkeuring
 - Werken aan meerdere services tegelijk zonder expliciete opdracht
+- Een taak direct in Firestore als voltooid markeren zonder akkoord van Dennis
+- Acties uitvoeren in externe systemen (Acuity, Sportivity, Customer.io) zonder akkoord van Dennis
 
 ---
 
