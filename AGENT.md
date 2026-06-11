@@ -104,9 +104,12 @@ De `slack-agent` handelt discrepanties in taakverwerking af via de Slack-thread 
 
 Niet elk bericht in een taak-thread is een systeemfout. De agent onderscheidt:
 
-- **Discrepantiesignaal** — medewerker geeft aan dat een taak gedaan is maar niet als voltooid staat, of dat iets niet klopt → onderzoek starten
-- **Operationele opmerking** — medewerker meldt iets over de uitvoering ("hij nam niet op") → registreren, niet onderzoeken
-- **Onduidelijk** → de agent stelt één gerichte vraag terug: "Bedoel je dat de taak al gedaan is maar nog openstaat?"
+- **Discrepantiesignaal** (`discrepancy`) — medewerker geeft aan dat een taak gedaan is maar niet als voltooid staat, ook impliciet ("afspraak staat ingepland") → onderzoek starten
+- **Operationele opmerking** (`operational`) — medewerker meldt iets over de uitvoering terwijl de taak nog niet klaar is ("hij nam niet op") → registreren, geen reactie
+- **Onduidelijk** (`unclear`) — bericht gaat over de taak maar intentie is niet helder → de agent stelt een contextuele vraag terug (gegenereerd door Gemini op basis van het bericht, geen vaste zin)
+- **Niet relevant** (`irrelevant`) — mention (@naam), intern overleg, vraag aan collega, off-topic → stilletjes negeren, geen reactie
+
+Pure `@mention` berichten worden afgevangen vóór de Gemini-aanroep (pre-filter).
 
 ### Onderzoeksproces
 
@@ -121,13 +124,16 @@ De agent raadpleegt Firestore (`tenants/{tenant_id}`) om te bepalen welke extern
 
 ### Herstelproces
 
-Herstel verloopt altijd via de normale pipeline — niet via directe Firestore-schrijfacties.
+De agent herstelt autonoom wanneer de root cause duidelijk is en de actie geen neveneffecten heeft buiten de taak zelf.
 
 **Voorkeursvolgorde:**
-1. Publiceer het correcte completion-event via het `events` topic — dit test tegelijk of de pipeline correct werkt
-2. Alleen als de pipeline zelf het probleem is: directe Firestore-update, na akkoord van Dennis
+1. **`pipeline_event`** — publiceer het correcte completion-event via het `events` topic én zet de taak direct op voltooid in Firestore + Slack
+2. **`firestore_direct`** — zet de taak direct op voltooid in Firestore + Slack, zonder pipeline-event (bijv. als de pipeline al correct verwerkt heeft maar de taakstatus niet bijgewerkt is)
+3. **`external_system`** of onbekende root cause — escaleer naar Dennis
 
-Systeemwijzigingen (code, deployment) vereisen altijd akkoord van Dennis via het normale escalatiepad.
+Na autonoom herstel wordt de medewerker gevraagd te bevestigen ("De taak is nu correct verwerkt — klopt dit?"). Bij bevestiging wordt `employee_confirmed: true` gezet in de foutlog.
+
+Systeemwijzigingen (code, deployment) vereisen altijd akkoord van Dennis.
 Acties in externe systemen (Acuity e-mailadres, Customer.io merge) vereisen altijd akkoord van Dennis.
 
 ### Communicatie richting medewerker
@@ -157,11 +163,11 @@ Ontbreekt: [waarom de oorzaak nog onduidelijk is]
 
 1. **Eén probleem tegelijk** — één discrepantie per thread, geen cross-taak conclusies
 2. **Gelaagd onderzoek** — stop zodra de root cause bekend is
-3. **Diagnose en herstel zijn gescheiden** — diagnose is autonoom, herstel vereist akkoord
-4. **Herstel via de pipeline** — niet via shortcuts, tenzij de pipeline zelf het probleem is
-5. **Elke actie is herleidbaar** — alles wordt gelogd in de Firestore foutlog
-6. **Escaleer bij vastlopen** — na twee stappen zonder antwoord, niet verder zonder menselijke input
-7. **Twijfel? Vraag terug** — één gerichte vraag, nooit aannames
+3. **Diagnose is autonoom, herstel ook** — mits root cause duidelijk en geen neveneffecten buiten de taak
+4. **Taak voltooien mag autonoom** — via `complete_task` (Firestore + Slack update) na `pipeline_event` of `firestore_direct` diagnose
+5. **Elke actie is herleidbaar** — alles wordt gelogd in `error_log` en `agent_sessions`
+6. **Escaleer bij vastlopen** — na twee stappen zonder antwoord, of bij `external_system` / onbekende root cause
+7. **Twijfel? Vraag terug** — één contextuele vraag gegenereerd door Gemini, nooit aannames
 
 ---
 
@@ -176,7 +182,7 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 | `tenant_id` | string | Tenant waar de fout optrad |
 | `task_doc_id` | string | Firestore doc_id van de betreffende taak |
 | `signal` | string | Wat de medewerker meldde |
-| `signal_type` | string | `discrepancy`, `operational`, `unclear` |
+| `signal_type` | string | `discrepancy`, `operational`, `unclear`, `irrelevant` |
 | `investigation_steps` | array | Welke bronnen zijn geraadpleegd in volgorde |
 | `root_cause` | string | Vastgestelde oorzaak |
 | `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `unknown` |
@@ -190,6 +196,38 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 ### Gebruik
 
 De foutlog is de primaire bron voor patroonherkenning. Periodiek worden terugkerende `root_cause_category` waarden geanalyseerd om structurele fixes te prioriteren.
+
+---
+
+## Firestore sessiestate
+
+De `slack-agent` slaat per thread een sessie op in `agent_sessions/{tenant_id}_{thread_ts}`.
+
+### Schema
+
+| Veld | Type | Inhoud |
+|---|---|---|
+| `tenant_id` | string | Tenant |
+| `channel_id` | string | Slack channel |
+| `thread_ts` | string | Thread timestamp (ook doc-ID suffix) |
+| `task_doc_id` | string | Firestore doc_id van de betreffende taak |
+| `status` | string | `investigating`, `unclear`, `awaiting_employee_confirmation`, `awaiting_dennis_approval`, `resolved` |
+| `signal` | string | Eerste bericht van de medewerker |
+| `signal_type` | string | `discrepancy`, `operational`, `unclear`, `irrelevant` |
+| `conversation` | array | `{role, content, timestamp}` — volledige gesprekshistorie |
+| `diagnosis` | dict | Gemini-diagnosresultaat |
+| `resolution_method` | string | Gekozen herstelroute |
+| `error_log_doc_id` | string | Verwijzing naar bijbehorend `error_log` document |
+| `created_at` | timestamp | Moment van aanmaak |
+| `updated_at` | timestamp | Laatste wijziging |
+
+### Statusovergangen
+
+`investigating` → diagnose klaar → `awaiting_employee_confirmation` (autonoom herstel) of `awaiting_dennis_approval` (escalatie)
+`awaiting_employee_confirmation` → bevestigd → `resolved` / ontkend → `investigating`
+`unclear` → herclassificatie → `investigating` of `resolved`
+
+Schrijven naar `agent_sessions` is autonome actie — geen goedkeuring vereist.
 
 ---
 
@@ -247,7 +285,7 @@ gcloud functions logs read [naam] \
 - Meerdere vragen tegelijk stellen
 - Een fix deployen zonder goedkeuring
 - Werken aan meerdere services tegelijk zonder expliciete opdracht
-- Een taak direct in Firestore als voltooid markeren zonder akkoord van Dennis
+- Een taak direct als voltooid markeren buiten de slack-agent correctieflow om, zonder akkoord van Dennis
 - Acties uitvoeren in externe systemen (Acuity, Sportivity, Customer.io) zonder akkoord van Dennis
 
 ---
