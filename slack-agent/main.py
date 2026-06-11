@@ -57,6 +57,22 @@ Root cause categorieën:
 - pipeline_error: technisch probleem in de verwerking
 - unknown: oorzaak niet vast te stellen
 
+Resolution methods:
+- pipeline_event: stuur een correctie-event via de pipeline om de taak te voltooien
+- firestore_direct: markeer de taak direct als voltooid in Firestore (geen pipeline actie nodig)
+- external_system: actie vereist in een extern systeem (Acuity, Sportivity, Customer.io)
+- escalate: oorzaak onbekend of herstel niet mogelijk zonder menselijke input
+
+Wanneer needs_dennis_approval FALSE is (agent lost autonoom op):
+- root_cause is duidelijk vastgesteld
+- resolution_method is pipeline_event of firestore_direct
+- er zijn geen neveneffecten buiten de taakstatus zelf
+
+Wanneer needs_dennis_approval TRUE is (escaleer naar Dennis):
+- root_cause is unknown
+- resolution_method is external_system of escalate
+- de fix heeft effecten buiten deze taak (bijv. datakwaliteit aanpassen, merges uitvoeren)
+
 Geef een JSON object terug:
 {
   "employee_message": "bericht voor de medewerker (max 2 zinnen, geen jargon)",
