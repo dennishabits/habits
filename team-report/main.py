@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import functions_framework
+import requests
 from google.cloud import bigquery, firestore, pubsub_v1
 from google import genai
 from slack_sdk import WebClient
@@ -15,6 +16,7 @@ REGION = "europe-west1"
 REPORT_CHANNEL_ID = "C0B7NK3240K"
 DENNIS_SLACK_ID = "U158QLHEF"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+MISSIVE_API_BASE = "https://public.missiveapp.com/v1"
 
 # Clients
 bq_client = bigquery.Client()
@@ -57,18 +59,21 @@ def notify_dennis(client, error_description, context=None):
 
 
 def get_daypart_window(daypart, report_date):
-    """Return start and end hours for a daypart."""
+    """Return start and end datetime (Amsterdam) for a daypart."""
     if daypart == 'ochtend':
-        return 7, 12
+        start_hour, end_hour = 7, 12
     elif daypart == 'middag':
-        return 16, 21
-    return None, None
+        start_hour, end_hour = 16, 21
+    else:
+        return None, None
+
+    start_dt = datetime(report_date.year, report_date.month, report_date.day, start_hour, 0, 0, tzinfo=AMSTERDAM_TZ)
+    end_dt = datetime(report_date.year, report_date.month, report_date.day, end_hour, 0, 0, tzinfo=AMSTERDAM_TZ)
+    return start_dt, end_dt
 
 
 def query_task_performance(tenant_id, daypart, report_date):
     """Query task performance aggregates for the daypart."""
-    start_hour, end_hour = get_daypart_window(daypart, report_date)
-
     query = f"""
     WITH daypart_tasks AS (
       SELECT
@@ -147,6 +152,128 @@ def query_appointments(tenant_id, daypart, report_date):
     return [dict(row) for row in results]
 
 
+def get_missive_config(tenant_id):
+    """Load Missive config from Firestore tenant document."""
+    try:
+        tenant_doc = firestore_client.collection("tenants").document(tenant_id).get()
+        if not tenant_doc.exists:
+            return None
+        data = tenant_doc.to_dict()
+        return data.get('missiveConfig')
+    except Exception as e:
+        print(f"❌ Error loading Missive config: {e}")
+        return None
+
+
+def fetch_missive_conversations(api_token, mailbox_id, window_start_ts, window_end_ts):
+    """
+    Fetch all conversations for a mailbox where created_at falls within the window.
+    Paginates until all conversations older than window_start are seen.
+    """
+    headers = {"Authorization": f"Bearer {api_token}"}
+    conversations = []
+    until = None
+    page = 0
+
+    while True:
+        params = {"mailbox": mailbox_id, "all": "true", "limit": 50}
+        if until:
+            params["until"] = until
+
+        response = requests.get(
+            f"{MISSIVE_API_BASE}/conversations",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        response.raise_for_status()
+        batch = response.json().get("conversations", [])
+        page += 1
+
+        if not batch:
+            break
+
+        for conv in batch:
+            created_at = conv.get("created_at", 0)
+            if window_start_ts <= created_at < window_end_ts:
+                conversations.append(conv)
+
+        oldest_activity = batch[-1].get("last_activity_at", 0)
+        if oldest_activity < window_start_ts:
+            break
+
+        until = oldest_activity
+
+        if page >= 20:
+            print(f"⚠️ Missive pagination cap reached for mailbox {mailbox_id}")
+            break
+
+    return conversations
+
+
+def get_missive_stats(tenant_id, daypart, report_date):
+    """
+    Fetch Missive conversation stats per mailbox for the daypart window.
+    Returns list of dicts with name, received, closed, open counts.
+    """
+    missive_config = get_missive_config(tenant_id)
+    if not missive_config:
+        return []
+
+    api_token = missive_config.get("missive_api_token")
+    mailbox_ids = missive_config.get("missive_mailbox_ids", [])
+    mailbox_names = missive_config.get("missive_mailbox_names", [])
+
+    if not api_token or not mailbox_ids:
+        return []
+
+    window_start, window_end = get_daypart_window(daypart, report_date)
+    if not window_start:
+        return []
+
+    window_start_ts = int(window_start.timestamp())
+    window_end_ts = int(window_end.timestamp())
+
+    results = []
+
+    for i, mailbox_id in enumerate(mailbox_ids):
+        name = mailbox_names[i] if i < len(mailbox_names) else mailbox_id
+        try:
+            conversations = fetch_missive_conversations(
+                api_token, mailbox_id, window_start_ts, window_end_ts
+            )
+
+            received = len(conversations)
+            closed = sum(
+                1 for c in conversations
+                if any(u.get("closed") for u in c.get("users", []))
+            )
+            open_count = received - closed
+
+            results.append({
+                "name": name,
+                "mailbox_id": mailbox_id,
+                "received": received,
+                "closed": closed,
+                "open": open_count,
+            })
+
+        except requests.HTTPError as e:
+            print(f"❌ Missive API error for mailbox {mailbox_id}: {e}")
+        except Exception as e:
+            print(f"❌ Unexpected error for mailbox {mailbox_id}: {e}")
+
+    log_json("ENRICHMENT_MISSIVE_CONVERSATIONS", {
+        "daypart": daypart,
+        "date": str(report_date),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "mailboxes": results
+    })
+
+    return results
+
+
 def get_prompts(tenant_id):
     """Load report prompts from Firestore config."""
     try:
@@ -159,7 +286,7 @@ def get_prompts(tenant_id):
     return None, None
 
 
-def build_data_summary(tasks, appointments, daypart, report_date):
+def build_data_summary(tasks, appointments, missive_stats, daypart, report_date):
     """Build a structured data summary for Gemini."""
     dutch_day = ['zondag', 'maandag', 'dinsdag', 'woensdag', 'donderdag', 'vrijdag', 'zaterdag']
     day_name = dutch_day[report_date.weekday() + 1 if report_date.weekday() < 6 else 0]
@@ -228,11 +355,23 @@ def build_data_summary(tasks, appointments, daypart, report_date):
         return {"completed": completed, "total": total}
 
     summary['task_categories'] = {
-        "bezoekerstaken": cat(['member_talk']),
         "afspraaktaken": {"completed": total_followup_scheduled, "total": total_followup_applicable},
-        "crm_taken": cat(['member_call']),
         "sales_taken": cat(['prospect_call']),
+        "crm_taken": cat(['member_call']),
+        "bezoekerstaken": cat(['member_talk']),
+        "administratietaken": cat(['member_admin']),
     }
+
+    # Missive stats
+    if missive_stats:
+        summary['klantberichten'] = {
+            "mailboxes": missive_stats,
+            "totals": {
+                "received": sum(m['received'] for m in missive_stats),
+                "closed": sum(m['closed'] for m in missive_stats),
+                "open": sum(m['open'] for m in missive_stats),
+            }
+        }
 
     return summary
 
@@ -291,13 +430,12 @@ def team_report(cloud_event):
             print("❌ Missing tenant_id or daypart")
             return "OK"
 
-        # Report date is today in Amsterdam time
         now_amsterdam = datetime.now(AMSTERDAM_TZ)
         report_date = now_amsterdam.date()
 
-        # Query data
         tasks = query_task_performance(tenant_id, daypart, report_date)
         appointments = query_appointments(tenant_id, daypart, report_date)
+        missive_stats = get_missive_stats(tenant_id, daypart, report_date)
 
         log_json("QUERY_TASKS", {"count": len(tasks), "tasks": tasks})
         log_json("QUERY_APPOINTMENTS", {"count": len(appointments), "appointments": appointments})
@@ -306,11 +444,9 @@ def team_report(cloud_event):
             print(f"No data for {daypart} on {report_date}")
             return "OK"
 
-        # Build data summary
-        data_summary = build_data_summary(tasks, appointments, daypart, report_date)
+        data_summary = build_data_summary(tasks, appointments, missive_stats, daypart, report_date)
         log_json("DATA_SUMMARY", data_summary)
 
-        # Load prompts
         management_prompt, employee_prompt = get_prompts(tenant_id)
 
         client = get_slack_client(tenant_id)
@@ -318,7 +454,6 @@ def team_report(cloud_event):
             print(f"❌ No Slack client for tenant {tenant_id}")
             return "OK"
 
-        # Management report
         if management_prompt:
             management_message = call_gemini(management_prompt, data_summary)
             post_to_slack(client, management_message, tenant_id)
@@ -326,7 +461,6 @@ def team_report(cloud_event):
         else:
             print("⚠️ No management prompt configured")
 
-        # Employee report
         if employee_prompt:
             employee_message = call_gemini(employee_prompt, data_summary)
             post_to_slack(client, employee_message, tenant_id)
