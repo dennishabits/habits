@@ -1,0 +1,6 @@
+functions-framework==3.*
+google-cloud-bigquery==3.*
+google-cloud-firestore==2.*
+google-cloud-pubsub==2.*
+google-genai==1.*
+requests==2.*

@@ -78,6 +78,18 @@ Een item op de backlog is geen commitment. Het is een vastgelegd idee met genoeg
 **Context**: gepland als onderdeel van de `slack-agent` service. Maakt gecontroleerde uitrol van AI-coaching mogelijk.
 **Afhankelijkheden**: `slack-agent` service.
 
+### Leren van team-antwoorden op coachingsvragen
+**Categorie**: feature
+**Waarde**: het coachingsbericht sluit af met een open vraag die het team beantwoordt in de thread. Door die antwoorden mee te geven aan het volgende rapport wordt coaching cumulatief — het systeem leert wat er speelt op de vloer en past zijn vragen en coaching aan op basis van eerder gegeven antwoorden.
+**Context**: het employee-rapport vraagt het team al om te reageren in de thread. De antwoorden gaan nu nergens naartoe. De benodigde stappen: (1) `slack-agent` of `slack-listener` pikt thread-replies op rapport-berichten op, (2) antwoorden worden opgeslagen in Firestore per tenant, (3) `team-report` haalt de laatste N antwoorden op en geeft ze mee aan Gemini als context bij het genereren van het volgende rapport.
+**Afhankelijkheden**: `slack-agent` service; Firestore opslag van thread-replies.
+
+### Eén configureerbare slack-agent die alle processen afhandelt
+**Categorie**: architectuur
+**Waarde**: voorkomt proliferatie van losse agent-services per proces. De agent is generiek; processen zijn configuratie in Firestore per tenant. Maakt het toevoegen van nieuwe processen mogelijk zonder nieuwe deployments.
+**Context**: nu zijn `habits-coach-reply` en `slack-agent` twee aparte services die hetzelfde basispatroon volgen: Slack bericht ontvangen → tenant lookup → intent herkenning → proces uitvoeren. Op termijn moet dit één service worden waarbij kanaal + intent bepalen welk proces wordt gestart. De assessment-laag (wat is de vraag?) en de process-laag (hoe beantwoord je die?) zijn gescheiden. Processen worden vastgelegd in `config/processes/{process_id}` met trigger_channels, trigger_intent, process_type en steps. De huidige `slack-agent` is al gebouwd met deze scheiding in gedachten — de stap naar volledig configureerbare processen is daarmee klein.
+**Afhankelijkheden**: voldoende proceservaring om het configuratieformaat te kunnen generaliseren; minimaal twee processen in productie.
+
 ---
 
 ## Onderzoek
