@@ -337,7 +337,7 @@ def send_crm_task_message(tenant_id, task_data):
         if not client:
             return None
 
-        action_type = task_data.get('event_action_type', payload.get('action_type', render_payload.get('action_type', '')))
+        action_type = task_data.get('event_action_type') or payload.get('action_type') or render_payload.get('action_type', '')
         crm_task_id = task_data.get('crm_task_id')
         customer_id = task_data.get('customer_id')
         email = task_data.get('email', payload.get('email', render_payload.get('email', '')))

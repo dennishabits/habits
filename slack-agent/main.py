@@ -27,14 +27,32 @@ Context: de instructeur reageert in de thread van een openstaande taak. De taak 
 Classificeer het bericht als:
 - "discrepancy": de instructeur meldt (impliciet of expliciet) dat de taak al is uitgevoerd, terwijl die nog openstaat. Dit omvat korte voltooiingsmeldingen zoals "afspraak staat ingepland", "is gedaan", "al afgehandeld", "heb ik al gebeld", "staat al in het systeem", "komt volgende week" — berichten die impliceren dat de actie al heeft plaatsgevonden.
 - "operational": de instructeur meldt iets over de uitvoering waarbij de taak nog NIET voltooid is (bijv. "hij nam niet op, bel ik morgen terug", "probeer het vandaag nog").
-- "unclear": het is echt onduidelijk of de taak al gedaan is of niet.
+- "unclear": het bericht gaat duidelijk over de taak, maar het is onduidelijk of die al gedaan is of niet.
+- "irrelevant": het bericht heeft niets met de taakstatus te maken — een mention (@naam), intern overleg, een groet, een vraag aan een collega, of anderszins duidelijk buiten de taakcontext.
 
-Twijfelregel: als een bericht een voltooiingsstatement bevat — ook al ontbreekt de expliciete klacht over de openstaande taak — kies dan "discrepancy".
+Twijfelregels:
+- Als een bericht een voltooiingsstatement bevat — ook al ontbreekt de expliciete klacht — kies "discrepancy".
+- Als het bericht overduidelijk niet over de taak gaat (mention, intern, off-topic) — kies "irrelevant", niet "unclear".
+- "unclear" alleen als het bericht wél over de taak lijkt te gaan maar de intentie echt onduidelijk is.
+
+Voorbeelden:
+- "@mark" → irrelevant (louter een mention, geen inhoud over de taak)
+- "@lisa kun jij dit oppakken?" → irrelevant (vraag aan collega, niet over taakstatus)
+- "Nee, dit is een intern bericht" → irrelevant (expliciet intern, niets over de taak)
+- "even overleggen met het team" → irrelevant (intern overleg)
+- "hij nam niet op" → operational (taak niet voltooid, bezig met uitvoering)
+- "afspraak staat ingepland" → discrepancy (taak gedaan maar staat nog open)
+- "heb ik gisteren al gedaan" → discrepancy (voltooiingsstatement)
+- "weet niet precies" → unclear (onduidelijk, maar lijkt over de taak te gaan)
 
 Als er gespreksgeschiedenis aanwezig is, gebruik die als context bij het classificeren.
 
 Geef ALLEEN een JSON object terug, geen andere tekst:
-{"classification": "discrepancy" | "operational" | "unclear", "reason": "korte uitleg"}
+{
+  "classification": "discrepancy" | "operational" | "unclear" | "irrelevant",
+  "reason": "korte uitleg",
+  "clarifying_question": "alleen invullen bij unclear: een concrete vraag die helpt de intentie te achterhalen. Max 1 zin, in het Nederlands, gericht op de taakcontext."
+}
 """
 
 INVESTIGATION_PROMPT = """
@@ -313,7 +331,25 @@ def call_gemini_json(system_prompt: str, user_message: str) -> dict:
         return {}
 
 
+def _prefilter_irrelevant(message: str) -> bool:
+    import re
+    stripped = message.strip()
+    # Pure mention(s): "@naam" or "@naam @naam2" with no other content
+    if re.fullmatch(r'(@\w+\s*)+', stripped):
+        return True
+    # Very short message (≤2 words) that starts with @ — e.g. "@mark check"
+    words = stripped.split()
+    if words and words[0].startswith('@') and len(words) <= 2:
+        return True
+    return False
+
+
 def classify_message(message: str, conversation: list = None) -> dict:
+    if _prefilter_irrelevant(message):
+        result = {"classification": "irrelevant", "reason": "pre-filter: mention or off-topic pattern"}
+        log({"CLASSIFICATION": result})
+        return result
+
     user_content = message
     if conversation:
         # Last 5 turns for context; role + content only — no structured PII
@@ -489,6 +525,10 @@ def handle_task_investigation(
         classification = classify_message(user_message, conversation)
         signal_type = classification.get("classification", "unclear")
 
+        if signal_type == "irrelevant":
+            log({"SKIPPED": {"reason": "irrelevant message in existing session", "session_doc_id": session_doc_id}})
+            return
+
         append_to_session_conversation(session_doc_id, "employee", user_message)
 
         if signal_type == "operational":
@@ -498,12 +538,9 @@ def handle_task_investigation(
 
         if signal_type == "unclear":
             update_session(session_doc_id, {"status": "unclear"})
-            slack_post(
-                token=slack_token, channel=channel_id,
-                text="Bedoel je dat de taak al gedaan is maar nog openstaat?",
-                thread_ts=thread_ts
-            )
-            log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts}})
+            question = classification.get("clarifying_question") or "Bedoel je dat de taak al gedaan is maar nog openstaat?"
+            slack_post(token=slack_token, channel=channel_id, text=question, thread_ts=thread_ts)
+            log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts, "question": question}})
             return
 
         # signal_type == "discrepancy" — continue investigation with task from session
@@ -531,6 +568,10 @@ def handle_task_investigation(
 
         classification = classify_message(user_message)
         signal_type = classification.get("classification", "unclear")
+
+        if signal_type == "irrelevant":
+            log({"SKIPPED": {"reason": "irrelevant message, no session created", "thread_ts": thread_ts}})
+            return
 
         create_session(session_doc_id, {
             "tenant_id": tenant_id,
@@ -567,12 +608,9 @@ def handle_task_investigation(
             return
 
         if signal_type == "unclear":
-            slack_post(
-                token=slack_token, channel=channel_id,
-                text="Bedoel je dat de taak al gedaan is maar nog openstaat?",
-                thread_ts=thread_ts
-            )
-            log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts}})
+            question = classification.get("clarifying_question") or "Bedoel je dat de taak al gedaan is maar nog openstaat?"
+            slack_post(token=slack_token, channel=channel_id, text=question, thread_ts=thread_ts)
+            log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts, "question": question}})
             return
 
     # ── Full discrepancy investigation ────────────────────────────────────────
