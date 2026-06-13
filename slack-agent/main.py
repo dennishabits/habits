@@ -25,31 +25,37 @@ Je bent een assistent die berichten van sportscholinstructeurs classificeert.
 Context: de instructeur reageert in de thread van een openstaande taak. De taak staat nog open in het systeem.
 
 Classificeer het bericht als:
-- "discrepancy": de instructeur meldt (impliciet of expliciet) dat de taak al is uitgevoerd, terwijl die nog openstaat. Dit omvat korte voltooiingsmeldingen zoals "afspraak staat ingepland", "is gedaan", "al afgehandeld", "heb ik al gebeld", "staat al in het systeem", "komt volgende week" — berichten die impliceren dat de actie al heeft plaatsgevonden.
-- "operational": de instructeur meldt iets over de uitvoering waarbij de taak nog NIET voltooid is (bijv. "hij nam niet op, bel ik morgen terug", "probeer het vandaag nog").
+- "discrepancy": de instructeur meldt (impliciet of expliciet) dat de taak al is uitgevoerd, terwijl die nog openstaat. Dit omvat korte voltooiingsmeldingen zoals "afspraak staat ingepland", "is gedaan", "al afgehandeld", "heb ik al gebeld", "staat al in het systeem" — berichten die impliceren dat de actie al heeft plaatsgevonden maar de taak nog openstaat.
+- "negative_outcome": de instructeur geeft aan dat de taak is uitgevoerd maar het resultaat negatief was. Voorbeelden: "Heeft geen interesse", "Wil geen afspraak", "Heeft al een sportschool", "Niet geïnteresseerd", "Belt niet terug".
+- "followup_requested": de instructeur geeft aan dat er vervolgcontact nodig is op een specifieke datum of in een specifieke week. Voorbeelden: "Terugbellen volgende week", "Bel haar in de week van 22 juni", "Over twee weken opnieuw proberen", "Bellen op 25 juni".
+- "followup_vague": de instructeur geeft aan dat er mogelijk vervolgcontact nodig is maar zonder concrete datum of week. Voorbeelden: "Komt later terug", "Mogelijk interesse", "Wil nog nadenken", "Belt zelf nog", "Later proberen".
+- "operational": de instructeur meldt iets over de uitvoering waarbij de taak nog NIET voltooid is en er geen vervolgafspraak is (bijv. "hij nam niet op, bel ik morgen terug", "probeer het vandaag nog").
 - "unclear": het bericht gaat duidelijk over de taak, maar het is onduidelijk of die al gedaan is of niet.
 - "irrelevant": het bericht heeft niets met de taakstatus te maken — een mention (@naam), intern overleg, een groet, een vraag aan een collega, of anderszins duidelijk buiten de taakcontext.
 
 Twijfelregels:
-- Als een bericht een voltooiingsstatement bevat — ook al ontbreekt de expliciete klacht — kies "discrepancy".
-- Als het bericht overduidelijk niet over de taak gaat (mention, intern, off-topic) — kies "irrelevant", niet "unclear".
+- "negative_outcome" gaat voor "discrepancy" als het bericht een negatief resultaat bevat (geen interesse, al lid, wil niet).
+- "followup_requested" vereist een concrete datum of tijdseenheid ("week van 22 juni", "volgende week", "over 2 weken"). Ontbreekt die → "followup_vague".
+- Als een bericht een voltooiingsstatement bevat zonder negatief resultaat en zonder vervolg — kies "discrepancy".
+- Als het bericht overduidelijk niet over de taak gaat — kies "irrelevant", niet "unclear".
 - "unclear" alleen als het bericht wél over de taak lijkt te gaan maar de intentie echt onduidelijk is.
 
 Voorbeelden:
-- "@mark" → irrelevant (louter een mention, geen inhoud over de taak)
-- "@lisa kun jij dit oppakken?" → irrelevant (vraag aan collega, niet over taakstatus)
-- "Nee, dit is een intern bericht" → irrelevant (expliciet intern, niets over de taak)
-- "even overleggen met het team" → irrelevant (intern overleg)
-- "hij nam niet op" → operational (taak niet voltooid, bezig met uitvoering)
-- "afspraak staat ingepland" → discrepancy (taak gedaan maar staat nog open)
-- "heb ik gisteren al gedaan" → discrepancy (voltooiingsstatement)
-- "weet niet precies" → unclear (onduidelijk, maar lijkt over de taak te gaan)
+- "@mark" → irrelevant
+- "@lisa kun jij dit oppakken?" → irrelevant
+- "hij nam niet op" → operational
+- "afspraak staat ingepland" → discrepancy
+- "heb ik gisteren al gedaan" → discrepancy
+- "Heeft geen interesse" → negative_outcome
+- "Wil nog nadenken" → followup_vague
+- "Terugbellen week van 22 juni" → followup_requested
+- "weet niet precies" → unclear
 
 Als er gespreksgeschiedenis aanwezig is, gebruik die als context bij het classificeren.
 
 Geef ALLEEN een JSON object terug, geen andere tekst:
 {
-  "classification": "discrepancy" | "operational" | "unclear" | "irrelevant",
+  "classification": "discrepancy" | "negative_outcome" | "followup_requested" | "followup_vague" | "operational" | "unclear" | "irrelevant",
   "reason": "korte uitleg",
   "clarifying_question": "alleen invullen bij unclear: een concrete vraag die helpt de intentie te achterhalen. Max 1 zin, in het Nederlands, gericht op de taakcontext."
 }
@@ -107,6 +113,29 @@ Geef een JSON object terug:
   "resolution_description": "wat er gedaan moet worden om te herstellen",
   "needs_dennis_approval": true|false,
   "escalation_summary": "alleen invullen als needs_dennis_approval true is"
+}
+"""
+
+
+DATE_EXTRACTION_PROMPT = """
+Je bent een datum-extractie-assistent. Extraheer een concrete vervolgdatum uit een Nederlands bericht.
+
+Gebruik de meegeleverde huidige datum als referentie voor relatieve uitdrukkingen:
+- "week van [dag] [maand]" → gebruik de maandag van die week
+- "volgende week" → maandag van de volgende kalenderweek
+- "over twee weken" → 14 dagen vanaf vandaag, afgerond naar de maandag van die week
+- Concrete datum ("25 juni", "donderdag 3 juli") → gebruik direct
+
+Geef ALLEEN een JSON object terug, geen andere tekst:
+{
+  "date": "YYYY-MM-DD",
+  "readable": "maandag 22 juni"
+}
+
+Als er geen datum te extraheren is, geef dan:
+{
+  "date": null,
+  "readable": null
 }
 """
 
@@ -230,10 +259,11 @@ def append_to_session_conversation(doc_id: str, role: str, content: str):
     })
 
 
-def complete_task(task_doc_id: str, task_data: dict, slack_token: str):
+def complete_task(task_doc_id: str, task_data: dict, slack_token: str, label: str = None):
     task_action = task_data.get("task_action", "")
     visitor_name = task_data.get("visitor_name", "Bezoeker")
-    label = f"{task_action} ingepland" if task_action else "Taak voltooid"
+    if label is None:
+        label = f"{task_action} ingepland" if task_action else "Taak voltooid"
 
     task_doc_ref = fs_client.collection("slack_messages").document(task_doc_id)
 
@@ -432,6 +462,105 @@ def publish_correction_event(tenant_id: str, task_data: dict, task_doc_id: str):
     }})
 
 
+# ── TASK LIFECYCLE EVENTS ────────────────────────────────────────────────────
+
+def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_type: str, extra_payload: dict = None):
+    envelope = {
+        "webhook_source": "slack-agent",
+        "tenant_id": tenant_id,
+        "event_type": event_type,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "customer_id": task_data.get("customer_id"),
+        "email": task_data.get("email"),
+        "payload": {
+            "task_doc_id": task_doc_id,
+            "task_type": task_data.get("task_type"),
+            **(extra_payload or {})
+        }
+    }
+    envelope = {k: v for k, v in envelope.items() if v is not None}
+    topic_path = publisher.topic_path(PROJECT_ID, "events")
+    publisher.publish(topic_path, json.dumps(envelope, default=str).encode("utf-8"))
+    log({"TO_EVENTS_TASK_EVENT": {"event_type": event_type, "task_doc_id": task_doc_id}})
+
+
+def extract_followup_date(message: str) -> dict:
+    today = datetime.now(AMSTERDAM_TZ).strftime("%Y-%m-%d")
+    result = call_gemini_json(DATE_EXTRACTION_PROMPT, f"Vandaag is {today}.\nBericht: {message}")
+    log({"DATE_EXTRACTION": result})
+    return result
+
+
+def handle_negative_outcome(
+    tenant_id: str, tenant: dict, channel_id: str, thread_ts: str,
+    user_message: str, session_doc_id: str, task_doc_id: str, task_data: dict, now: str
+):
+    slack_token = tenant.get("slack_bot_token")
+    complete_task(task_doc_id, task_data, slack_token, label="Geen interesse")
+    publish_task_event(tenant_id, task_doc_id, task_data, "task_completed", {
+        "outcome": "negative",
+        "note": user_message
+    })
+    reply = "Begrepen — taak afgesloten als afgehandeld zonder vervolg."
+    slack_post(token=slack_token, channel=channel_id, text=reply, thread_ts=thread_ts)
+    update_session(session_doc_id, {
+        "status": "resolved",
+        "conversation": firestore.ArrayUnion([
+            {"role": "agent", "content": reply, "timestamp": now}
+        ])
+    })
+    log({"NEGATIVE_OUTCOME_RESOLVED": {"task_doc_id": task_doc_id}})
+
+
+def handle_followup_requested(
+    tenant_id: str, tenant: dict, channel_id: str, thread_ts: str,
+    user_message: str, session_doc_id: str, task_doc_id: str, task_data: dict, now: str
+):
+    slack_token = tenant.get("slack_bot_token")
+    date_result = extract_followup_date(user_message)
+    followup_date = date_result.get("date")
+    followup_readable = date_result.get("readable") or followup_date
+
+    if not followup_date:
+        question = "Wanneer wil je deze persoon terugbellen? Geef een concrete datum of week, dan maak ik een nieuwe taak aan."
+        slack_post(token=slack_token, channel=channel_id, text=question, thread_ts=thread_ts)
+        update_session(session_doc_id, {
+            "status": "pending_followup",
+            "pending_intent": "followup_requested",
+            "conversation": firestore.ArrayUnion([
+                {"role": "agent", "content": question, "timestamp": now}
+            ])
+        })
+        log({"FOLLOWUP_DATE_EXTRACTION_FAILED": {"session_doc_id": session_doc_id}})
+        return
+
+    complete_task(task_doc_id, task_data, slack_token, label=f"Terugbellen {followup_readable}")
+    publish_task_event(tenant_id, task_doc_id, task_data, "task_completed", {
+        "outcome": "followup_planned",
+        "note": user_message
+    })
+    publish_task_event(tenant_id, task_doc_id, task_data, "task_followup_requested", {
+        "followup_date": followup_date,
+        "note": user_message,
+        "original_task_doc_id": task_doc_id
+    })
+    reply = f"Begrepen — ik plan een nieuwe taak op {followup_readable}."
+    slack_post(token=slack_token, channel=channel_id, text=reply, thread_ts=thread_ts)
+    update_session(session_doc_id, {
+        "status": "resolved",
+        "conversation": firestore.ArrayUnion([
+            {"role": "agent", "content": reply, "timestamp": now}
+        ])
+    })
+    log({"FOLLOWUP_REQUESTED_RESOLVED": {"task_doc_id": task_doc_id, "followup_date": followup_date}})
+
+
+def handle_followup_vague(slack_token: str, channel_id: str, thread_ts: str, session_doc_id: str):
+    question = "Wanneer wil je deze persoon terugbellen? Geef een concrete datum of week, dan maak ik een nieuwe taak aan."
+    slack_post(token=slack_token, channel=channel_id, text=question, thread_ts=thread_ts)
+    log({"TO_SLACK_FOLLOWUP_QUESTION": {"session_doc_id": session_doc_id}})
+
+
 # ── SESSION STATE HANDLERS ────────────────────────────────────────────────────
 
 def handle_awaiting_confirmation(
@@ -510,6 +639,17 @@ def handle_task_investigation(
         status = session.get("status")
         log({"SESSION_FOUND": {"doc_id": session_doc_id, "status": status}})
 
+        if status == "pending_followup":
+            append_to_session_conversation(session_doc_id, "employee", user_message)
+            task_doc_id = session.get("task_doc_id")
+            task_doc = fs_client.collection("slack_messages").document(task_doc_id).get() if task_doc_id else None
+            task_data = task_doc.to_dict() if task_doc and task_doc.exists else {}
+            handle_followup_requested(
+                tenant_id, tenant, channel_id, thread_ts, user_message,
+                session_doc_id, task_doc_id, task_data, now
+            )
+            return
+
         if status == "awaiting_employee_confirmation":
             handle_awaiting_confirmation(
                 session_doc_id, session, slack_token, channel_id, thread_ts, user_message
@@ -549,6 +689,27 @@ def handle_task_investigation(
             log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts, "question": question}})
             return
 
+        if signal_type == "negative_outcome":
+            task_doc_id = session.get("task_doc_id")
+            task_doc = fs_client.collection("slack_messages").document(task_doc_id).get() if task_doc_id else None
+            task_data = task_doc.to_dict() if task_doc and task_doc.exists else {}
+            update_session(session_doc_id, {"status": "resolving"})
+            handle_negative_outcome(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now)
+            return
+
+        if signal_type == "followup_requested":
+            task_doc_id = session.get("task_doc_id")
+            task_doc = fs_client.collection("slack_messages").document(task_doc_id).get() if task_doc_id else None
+            task_data = task_doc.to_dict() if task_doc and task_doc.exists else {}
+            update_session(session_doc_id, {"status": "resolving"})
+            handle_followup_requested(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now)
+            return
+
+        if signal_type == "followup_vague":
+            update_session(session_doc_id, {"status": "pending_followup", "pending_intent": "followup_requested"})
+            handle_followup_vague(slack_token, channel_id, thread_ts, session_doc_id)
+            return
+
         # signal_type == "discrepancy" — continue investigation with task from session
         update_session(session_doc_id, {"status": "investigating"})
         task_doc_id = session.get("task_doc_id")
@@ -579,14 +740,21 @@ def handle_task_investigation(
             log({"SKIPPED": {"reason": "irrelevant message, no session created", "thread_ts": thread_ts}})
             return
 
+        _status_map = {
+            "discrepancy": "investigating",
+            "negative_outcome": "resolving",
+            "followup_requested": "resolving",
+            "followup_vague": "pending_followup",
+        }
         create_session(session_doc_id, {
             "tenant_id": tenant_id,
             "channel_id": channel_id,
             "thread_ts": thread_ts,
             "task_doc_id": task_doc_id,
-            "status": "investigating" if signal_type == "discrepancy" else signal_type,
+            "status": _status_map.get(signal_type, signal_type),
             "signal": user_message,
             "signal_type": signal_type,
+            "pending_intent": "followup_requested" if signal_type == "followup_vague" else None,
             "conversation": [{"role": "employee", "content": user_message, "timestamp": now}],
             "diagnosis": None,
             "resolution_method": None,
@@ -617,6 +785,18 @@ def handle_task_investigation(
             question = classification.get("clarifying_question") or "Bedoel je dat de taak al gedaan is maar nog openstaat?"
             slack_post(token=slack_token, channel=channel_id, text=question, thread_ts=thread_ts)
             log({"TO_SLACK_CLARIFICATION": {"thread_ts": thread_ts, "question": question}})
+            return
+
+        if signal_type == "negative_outcome":
+            handle_negative_outcome(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now)
+            return
+
+        if signal_type == "followup_requested":
+            handle_followup_requested(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now)
+            return
+
+        if signal_type == "followup_vague":
+            handle_followup_vague(slack_token, channel_id, thread_ts, session_doc_id)
             return
 
     # ── Full discrepancy investigation ────────────────────────────────────────

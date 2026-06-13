@@ -477,6 +477,40 @@ def extract_business_context(envelope):
     return business_context
 
 
+def track_anonymous_event(site_id, api_key, email, event_name, event_data=None):
+    """Track an event in Customer.io using email as identifier (for customers without a numeric ID)."""
+    compatible = add_customerio_legacy_compatibility(event_data or {})
+    converted = convert_payload_datetimes_to_epoch(compatible)
+    payload = {"name": event_name, "email": email, "data": converted}
+    url = f"{CUSTOMERIO_API_BASE}/events"
+    call_customerio_api("POST", url, site_id, api_key, payload)
+    return {"action": "track_anonymous_event", "email": email, "event_name": event_name, "event_data": converted}
+
+
+def handle_task_followup_requested_event(envelope, site_id, api_key):
+    """Forward task_followup_requested to Customer.io to trigger follow-up journeys."""
+    payload = envelope.get("payload", {})
+    customer_id = envelope.get("customer_id")
+    email = envelope.get("email")
+
+    event_data = {k: v for k, v in {
+        "followup_date": payload.get("followup_date"),
+        "task_type": payload.get("task_type"),
+        "note": payload.get("note"),
+        "original_task_doc_id": payload.get("original_task_doc_id"),
+    }.items() if v is not None}
+
+    log_json("TASK_FOLLOWUP_REQUESTED", {"customer_id": customer_id, "email": email, "event_data": event_data})
+
+    if customer_id:
+        return track_event(site_id, api_key, customer_id, "task_followup_requested", event_data)
+    elif email:
+        return track_anonymous_event(site_id, api_key, email, "task_followup_requested", event_data)
+    else:
+        print("task_followup_requested missing both customer_id and email")
+        return None
+
+
 def handle_customer_update_event(envelope, site_id, api_key):
     """Handle customer_update events - send ALL data to Customer.io as customer update"""
     payload = envelope.get("payload", {})
@@ -731,12 +765,18 @@ def customerio_listener(cloud_event):
             if result:
                 outputs.append(result)
         
+        # Handle task follow-up events from slack-agent
+        elif event_type == "task_followup_requested":
+            result = handle_task_followup_requested_event(envelope, site_id, api_key)
+            if result:
+                outputs.append(result)
+
         # Handle behavioral events (visit, suspension, addon)
         elif event_type in ["visit", "suspension", "addon"]:
             result = handle_behavioral_event(envelope, site_id, api_key)
             if result:
                 outputs.extend(result if isinstance(result, list) else [result])
-        
+
         # Handle any other events as behavioral events
         else:
             result = handle_behavioral_event(envelope, site_id, api_key)
