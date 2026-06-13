@@ -476,16 +476,21 @@ def expire_crm_task(tenant_id, task_type, customer_id, email, envelope):
         if not client:
             return None
 
-        today_date = datetime.now().strftime('%Y-%m-%d')
         results = []
 
         if task_type in ['prospect_call', 'member_admin', 'lead_call', 'order_processing', 'subscription_change']:
             if not email:
                 log_json("EXPIRE_CRM_TASK_NO_EMAIL", envelope, {"task_type": task_type})
                 return None
-            doc_ids = [(f"{tenant_id}_{TAKEN_CHANNEL_ID}_{task_type}_{hash_email(email)}_{today_date}", TAKEN_CHANNEL_ID)]
+            doc_ids = [
+                (f"{tenant_id}_{TAKEN_CHANNEL_ID}_{task_type}_{hash_email(email)}_{date_str}", TAKEN_CHANNEL_ID)
+                for date_str in get_date_range_days(2)
+            ]
         else:
-            doc_ids = [(f"{tenant_id}_{TAKEN_CHANNEL_ID}_{customer_id}_{today_date}", TAKEN_CHANNEL_ID)]
+            doc_ids = [
+                (f"{tenant_id}_{TAKEN_CHANNEL_ID}_{customer_id}_{date_str}", TAKEN_CHANNEL_ID)
+                for date_str in get_date_range_days(2)
+            ]
 
         for doc_id, channel_id in doc_ids:
             task_doc_ref = firestore_client.collection("slack_messages").document(doc_id)
