@@ -272,6 +272,18 @@ gcloud functions deploy [naam] \
 | `habits-coach-reply` | `habits_coach_reply` |
 | `habits-coach-weekly` | `habits_coach_weekly` |
 
+### Dead-letter queue (events topic)
+
+Als slack-listener een bericht 5 keer niet kan verwerken, belandt het in `events-dead-letter`. Inspecteer zo:
+
+```bash
+gcloud pubsub subscriptions pull events-dead-letter-viewer \
+  --limit=10 --auto-ack \
+  --project=solid-future-452906-a2
+```
+
+Om een bericht te replayen: publiceer het handmatig opnieuw naar het `events` topic na de oorzaak te hebben opgelost.
+
 ### GEMINI_API_KEY meegeven bij deployment
 
 ```bash
