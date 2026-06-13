@@ -2,7 +2,7 @@ import base64
 import json
 import os
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.cloud import firestore, pubsub_v1
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -146,14 +146,23 @@ def slack_interactions(cloud_event):
             "tenant_id": tenant_id
         })
 
-        # Look up Firestore doc by email + date
-        today_date = datetime.now().strftime('%Y-%m-%d')
-        doc_id = f"{tenant_id}_{TAKEN_CHANNEL_ID}_lead_{hash_email(email)}_{today_date}"
-        task_doc_ref = firestore_client.collection("slack_messages").document(doc_id)
-        task_doc = task_doc_ref.get()
+        # Look up Firestore doc by email + Amsterdam date (2-day range for midnight edge cases)
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Amsterdam"))
+        date_range = [(now - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(2)]
 
-        if not task_doc.exists:
-            print(f"❌ No task doc found: {doc_id}")
+        task_doc_ref = None
+        task_doc = None
+        doc_id = None
+        for date_str in date_range:
+            doc_id = f"{tenant_id}_{TAKEN_CHANNEL_ID}_lead_{hash_email(email)}_{date_str}"
+            task_doc_ref = firestore_client.collection("slack_messages").document(doc_id)
+            task_doc = task_doc_ref.get()
+            if task_doc.exists:
+                break
+
+        if not task_doc or not task_doc.exists:
+            print(f"❌ No task doc found for lead_call, email: {email}")
             return "OK"
 
         task_data = task_doc.to_dict()
