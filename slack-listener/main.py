@@ -232,10 +232,17 @@ def sort_activities_by_timestamp(activities):
 
 
 def get_date_range_48h():
-    """Return list of date strings covering the last 48 hours."""
-    today = datetime.now()
-    yesterday = today - timedelta(days=1)
-    return [today.strftime('%Y-%m-%d'), yesterday.strftime('%Y-%m-%d')]
+    """Return list of date strings covering the last 48 hours (Amsterdam timezone)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Amsterdam"))
+    return [(now - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(2)]
+
+
+def get_date_range_days(days):
+    """Return list of date strings covering the last N days (Amsterdam timezone)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Europe/Amsterdam"))
+    return [(now - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days)]
 
 
 def render_crm_task_message(payload):
@@ -380,8 +387,12 @@ def send_crm_task_message(tenant_id, task_data):
 
         message_text = render_crm_task_message(render_payload)
 
-        now = datetime.now()
-        expires_at = datetime.now() + timedelta(days=7) if task_type in ['member_admin', 'order_processing'] else datetime(now.year, now.month, now.day, 23, 59, 59)
+        from zoneinfo import ZoneInfo
+        now_amsterdam = datetime.now(ZoneInfo("Europe/Amsterdam"))
+        if task_type in ['member_admin', 'order_processing']:
+            expires_at = datetime.now() + timedelta(days=7)
+        else:
+            expires_at = now_amsterdam.replace(hour=23, minute=59, second=59, microsecond=0).astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
         if not visible:
             firestore_client.collection("slack_messages").document(doc_id).set({
@@ -781,28 +792,31 @@ def complete_lead_task_for_membership(tenant_id, email, membership_data):
         else:
             completion_text_action = "Lidmaatschap gestart"
 
-        today_date = datetime.now().strftime('%Y-%m-%d')
-
-        doc_id_taken = f"{tenant_id}_{TAKEN_CHANNEL_ID}_prospect_call_{hash_email(email)}_{today_date}"
-        taken_doc = firestore_client.collection("slack_messages").document(doc_id_taken).get()
-        if taken_doc.exists:
+        for date_str in get_date_range_days(7):
+            doc_id_taken = f"{tenant_id}_{TAKEN_CHANNEL_ID}_prospect_call_{hash_email(email)}_{date_str}"
+            taken_doc = firestore_client.collection("slack_messages").document(doc_id_taken).get()
+            if not taken_doc.exists:
+                continue
             taken_data = taken_doc.to_dict()
-            if not taken_data.get('completed', False) and not taken_data.get('expired', False):
-                message_ts = taken_data['message_ts']
-                channel = taken_data['channel']
-                visitor_name = taken_data.get('visitor_name', 'Lead')
-                try:
-                    client.chat_update(
-                        channel=channel, ts=message_ts,
-                        text=f"✅ ~{visitor_name}~ • {completion_text_action}",
-                        blocks=[], mrkdwn=True
-                    )
-                    firestore_client.collection("slack_messages").document(doc_id_taken).update({'completed': True, 'completed_at': firestore.SERVER_TIMESTAMP})
-                    result = {"action": "complete_lead_task_taken", "channel": channel, "email": email}
-                    log_json("LEAD_TASK_COMPLETED_FOR_MEMBERSHIP_TAKEN", membership_data, result)
-                    return result
-                except Exception as e:
-                    print(f"❌ Error completing lead task in taken: {e}")
+            if taken_data.get('completed', False) or taken_data.get('expired', False):
+                continue
+            message_ts = taken_data.get('message_ts')
+            channel = taken_data.get('channel')
+            visitor_name = taken_data.get('visitor_name', 'Lead')
+            if not message_ts or not channel:
+                continue
+            try:
+                client.chat_update(
+                    channel=channel, ts=message_ts,
+                    text=f"✅ ~{visitor_name}~ • {completion_text_action}",
+                    blocks=[], mrkdwn=True
+                )
+                firestore_client.collection("slack_messages").document(doc_id_taken).update({'completed': True, 'completed_at': firestore.SERVER_TIMESTAMP})
+                result = {"action": "complete_lead_task_taken", "channel": channel, "email": email}
+                log_json("LEAD_TASK_COMPLETED_FOR_MEMBERSHIP_TAKEN", membership_data, result)
+                return result
+            except Exception as e:
+                print(f"❌ Error completing lead task in taken: {e}")
 
         return None
 
@@ -816,7 +830,6 @@ def complete_member_admin_task(tenant_id, email, membership_data):
         if not email:
             return None
 
-        today_date = datetime.now().strftime('%Y-%m-%d')
         client = get_slack_client(tenant_id)
         if not client:
             return None
@@ -836,49 +849,50 @@ def complete_member_admin_task(tenant_id, email, membership_data):
         results = []
 
         for task_type in ['member_admin', 'subscription_change']:
-            doc_id = f"{tenant_id}_{TAKEN_CHANNEL_ID}_{task_type}_{hash_email(email)}_{today_date}"
-            task_doc_ref = firestore_client.collection("slack_messages").document(doc_id)
-            task_doc = task_doc_ref.get()
+            for date_str in get_date_range_days(7):
+                doc_id = f"{tenant_id}_{TAKEN_CHANNEL_ID}_{task_type}_{hash_email(email)}_{date_str}"
+                task_doc_ref = firestore_client.collection("slack_messages").document(doc_id)
+                task_doc = task_doc_ref.get()
 
-            if not task_doc.exists:
-                continue
+                if not task_doc.exists:
+                    continue
 
-            task_data = task_doc.to_dict()
+                task_data = task_doc.to_dict()
 
-            if task_data.get('completed', False) or task_data.get('expired', False):
-                continue
+                if task_data.get('completed', False) or task_data.get('expired', False):
+                    continue
 
-            if not task_data.get('visible', True):
+                if not task_data.get('visible', True):
+                    task_doc_ref.update({'completed': True, 'completed_at': firestore.SERVER_TIMESTAMP})
+                    result = {"action": "complete_member_admin_task_invisible", "email": email, "task_type": task_type}
+                    log_json("MEMBER_ADMIN_TASK_COMPLETED_INVISIBLE", membership_data, result)
+                    results.append(result)
+                    continue
+
+                message_ts = task_data.get('message_ts')
+                channel = task_data.get('channel')
+                visitor_name = task_data.get('visitor_name', '')
+
+                if not message_ts or not channel:
+                    continue
+
+                client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text=f"✅ ~{visitor_name}~ • {completion_text_action}",
+                    mrkdwn=True
+                )
                 task_doc_ref.update({'completed': True, 'completed_at': firestore.SERVER_TIMESTAMP})
-                result = {"action": "complete_member_admin_task_invisible", "email": email, "task_type": task_type}
-                log_json("MEMBER_ADMIN_TASK_COMPLETED_INVISIBLE", membership_data, result)
+
+                result = {
+                    "action": "complete_member_admin_task",
+                    "message_ts": message_ts,
+                    "channel": channel,
+                    "email": email,
+                    "task_type": task_type
+                }
+                log_json("MEMBER_ADMIN_TASK_COMPLETED", membership_data, result)
                 results.append(result)
-                continue
-
-            message_ts = task_data.get('message_ts')
-            channel = task_data.get('channel')
-            visitor_name = task_data.get('visitor_name', '')
-
-            if not message_ts or not channel:
-                continue
-
-            client.chat_update(
-                channel=channel,
-                ts=message_ts,
-                text=f"✅ ~{visitor_name}~ • {completion_text_action}",
-                mrkdwn=True
-            )
-            task_doc_ref.update({'completed': True, 'completed_at': firestore.SERVER_TIMESTAMP})
-
-            result = {
-                "action": "complete_member_admin_task",
-                "message_ts": message_ts,
-                "channel": channel,
-                "email": email,
-                "task_type": task_type
-            }
-            log_json("MEMBER_ADMIN_TASK_COMPLETED", membership_data, result)
-            results.append(result)
 
         return results[0] if results else None
 
