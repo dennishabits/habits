@@ -68,11 +68,17 @@ Regels:
 - Geen jargon, geen architectuuruitleg
 - Stel één gerichte vraag als iets onduidelijk is
 
+Kritische regels over taakstatus:
+- Het veld `expired` (true/false) is de ENIGE indicator of een taak verlopen is. Als `expired: false`, is de taak NIET verlopen.
+- Het veld `expires_at` is alleen administratieve metadata en heeft GEEN invloed op taakgedrag. Gebruik het NIET om te concluderen dat een taak verlopen is.
+- `late_completion` mag ALLEEN gebruikt worden als `expired: true` én de actie aantoonbaar ná die vervaldatum heeft plaatsgevonden.
+
 Root cause categorieën:
-- timezone_mismatch: datum/tijdproblemen door timezone conversie
+- webhook_delay: het voltooiingsevent was nog onderweg toen de medewerker dit meldde; het systeem zou de taak vanzelf voltooien zodra het event binnenkomt. Gebruik dit als er geen voltooiingsevent in BigQuery staat maar de handeling wel al is uitgevoerd.
+- pipeline_error: het voltooiingsevent staat wél in BigQuery maar de taak is toch niet voltooid — het event is ergens in de verwerking verloren gegaan of niet correct verwerkt.
+- timezone_mismatch: datum/tijdproblemen door timezone conversie (UTC vs Amsterdam)
 - duplicate_email: klant heeft meerdere e-mailadressen in verschillende systemen
-- late_completion: afspraak ingepland na verlopen van de taak
-- pipeline_error: technisch probleem in de verwerking
+- late_completion: actie uitgevoerd ná de vervaldatum — ALLEEN te gebruiken als `expired: true`
 - unknown: oorzaak niet vast te stellen
 
 Resolution methods:
@@ -95,7 +101,7 @@ Geef een JSON object terug:
 {
   "employee_message": "bericht voor de medewerker (max 2 zinnen, geen jargon)",
   "root_cause": "beschrijving van de oorzaak",
-  "root_cause_category": "timezone_mismatch|duplicate_email|late_completion|pipeline_error|unknown",
+  "root_cause_category": "webhook_delay|pipeline_error|timezone_mismatch|duplicate_email|late_completion|unknown",
   "resolution_possible": true|false,
   "resolution_method": "pipeline_event|firestore_direct|external_system|escalate",
   "resolution_description": "wat er gedaan moet worden om te herstellen",
@@ -369,9 +375,9 @@ def investigate_discrepancy(task_data: dict, events: list, employee_message: str
             "customer_id": task_data.get("customer_id"),
             "email": task_data.get("email"),
             "created_at": str(task_data.get("created_at")),
-            "expires_at": str(task_data.get("expires_at")),
-            "completed": task_data.get("completed"),
-            "expired": task_data.get("expired"),
+            # expired is the authoritative state; expires_at is admin metadata only and is intentionally omitted
+            "is_expired": bool(task_data.get("expired", False)),
+            "is_completed": bool(task_data.get("completed", False)),
             "task_action": task_data.get("task_action"),
             "visible": task_data.get("visible"),
         },
