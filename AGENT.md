@@ -256,6 +256,22 @@ gcloud functions deploy [naam] \
   --project=solid-future-452906-a2
 ```
 
+**Bekende entry points per service** (gebruik exact deze namen — een verkeerde naam geeft een `MissingTargetException` bij elke invocation):
+
+| Service | `--entry-point` |
+|---|---|
+| `slack-listener` | `slack_crm_pipeline` |
+| `slack-agent` | `slack_agent` |
+| `acuity-enricher` | `acuity_enricher` |
+| `acuity-translator` | `acuity_pipeline` |
+| `sportivity-enricher` | `sportivity_enricher` |
+| `sportivity-translator` | `sportivity_pipeline` |
+| `customerio-listener` | `customerio_listener` |
+| `customerio-translator` | `customerio_pipeline` |
+| `coaching-listener` | `coaching_listener` |
+| `habits-coach-reply` | `habits_coach_reply` |
+| `habits-coach-weekly` | `habits_coach_weekly` |
+
 ### GEMINI_API_KEY meegeven bij deployment
 
 ```bash
