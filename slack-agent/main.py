@@ -663,8 +663,19 @@ def handle_task_investigation(
             return
 
         if status == "resolved":
-            log({"SESSION_ALREADY_RESOLVED": {"session_doc_id": session_doc_id}})
-            return
+            # If the task is still open, a new signal is meaningful — fall through to re-classify
+            task_doc_id_check = session.get("task_doc_id")
+            task_is_open = False
+            if task_doc_id_check:
+                task_doc_check = fs_client.collection("slack_messages").document(task_doc_id_check).get()
+                if task_doc_check.exists:
+                    td = task_doc_check.to_dict()
+                    if not td.get("completed", False) and not td.get("expired", False):
+                        task_is_open = True
+            if not task_is_open:
+                log({"SESSION_ALREADY_RESOLVED": {"session_doc_id": session_doc_id}})
+                return
+            log({"SESSION_RESOLVED_BUT_TASK_OPEN": {"session_doc_id": session_doc_id, "task_doc_id": task_doc_id_check}})
 
         # status in ("investigating", "unclear") — re-classify with conversation context
         conversation = session.get("conversation", [])
