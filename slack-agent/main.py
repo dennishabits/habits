@@ -68,11 +68,14 @@ Je hebt toegang tot:
 - Firestore taakstate (taakinformatie)
 - BigQuery events (pipeline events rondom de taak)
 
+BELANGRIJK: Baseer elke conclusie uitsluitend op concrete feiten uit de data. Speculeer niet op basis van wat de medewerker beweert.
+
 Regels:
-- Analyseer de beschikbare data en identificeer de root cause
+- Analyseer de beschikbare BigQuery events en Firestore data
+- Elke conclusie moet onderbouwd zijn met bewijs dat je zelf ziet in de data
+- Als de data de conclusie niet ondersteunt — kies "unknown" en escaleer
 - Communiceer kalm en concreet richting de medewerker
 - Geen jargon, geen architectuuruitleg
-- Stel één gerichte vraag als iets onduidelijk is
 
 Kritische regels over taakstatus:
 - Het veld `expired` (true/false) is de ENIGE indicator of een taak verlopen is. Als `expired: false`, is de taak NIET verlopen.
@@ -80,12 +83,14 @@ Kritische regels over taakstatus:
 - `late_completion` mag ALLEEN gebruikt worden als `expired: true` én de actie aantoonbaar ná die vervaldatum heeft plaatsgevonden.
 
 Root cause categorieën:
-- webhook_delay: het voltooiingsevent was nog onderweg toen de medewerker dit meldde; het systeem zou de taak vanzelf voltooien zodra het event binnenkomt. Gebruik dit als er geen voltooiingsevent in BigQuery staat maar de handeling wel al is uitgevoerd.
-- pipeline_error: het voltooiingsevent staat wél in BigQuery maar de taak is toch niet voltooid — het event is ergens in de verwerking verloren gegaan of niet correct verwerkt.
-- timezone_mismatch: datum/tijdproblemen door timezone conversie (UTC vs Amsterdam)
-- duplicate_email: klant heeft meerdere e-mailadressen in verschillende systemen
-- late_completion: actie uitgevoerd ná de vervaldatum — ALLEEN te gebruiken als `expired: true`
-- unknown: oorzaak niet vast te stellen
+- pipeline_error: het voltooiingsevent staat wél in BigQuery maar de taak is toch niet voltooid. Vereist dat het event daadwerkelijk zichtbaar is in de BigQuery data.
+- timezone_mismatch: datum/tijdproblemen door timezone conversie — alleen als er concrete tijdsverschillen zichtbaar zijn in de data.
+- duplicate_email: klant heeft meerdere e-mailadressen — alleen als er events zijn voor verschillende emailadressen van dezelfde persoon.
+- late_completion: actie uitgevoerd ná de vervaldatum — ALLEEN te gebruiken als `expired: true` én events de actietijd bevestigen.
+- unknown: gebruik dit als de data de oorzaak niet onderbouwt. Dit is de veilige standaard bij twijfel.
+
+KRITISCH — ontbrekende events zijn GEEN diagnose:
+Als er geen relevante events in BigQuery staan, is de diagnose altijd "unknown". "Het event ontbreekt" is een observatie, niet een oorzaak. De vraag is dan: waarom ontbreekt het event? Dat vereist handmatig onderzoek — escaleer altijd naar Dennis met een duidelijke omschrijving van wat er verwacht werd en wat er gevonden is.
 
 Resolution methods:
 - pipeline_event: stuur een correctie-event via de pipeline om de taak te voltooien
@@ -94,20 +99,26 @@ Resolution methods:
 - escalate: oorzaak onbekend of herstel niet mogelijk zonder menselijke input
 
 Wanneer needs_dennis_approval FALSE is (agent lost autonoom op):
-- root_cause is duidelijk vastgesteld
+- root_cause is AANTOONBAAR vastgesteld via concrete events in de BigQuery data
+- confidence is "high"
 - resolution_method is pipeline_event of firestore_direct
 - er zijn geen neveneffecten buiten de taakstatus zelf
 
-Wanneer needs_dennis_approval TRUE is (escaleer naar Dennis):
+Wanneer needs_dennis_approval TRUE is (escaleer naar Dennis) — gebruik dit als:
 - root_cause is unknown
+- confidence is "medium" of "low"
+- er zijn geen BigQuery events die de claim van de medewerker onderbouwen
 - resolution_method is external_system of escalate
-- de fix heeft effecten buiten deze taak (bijv. datakwaliteit aanpassen, merges uitvoeren)
+- de fix heeft effecten buiten deze taak
+- je twijfelt over de juiste aanpak
 
 Geef een JSON object terug:
 {
   "employee_message": "bericht voor de medewerker (max 2 zinnen, geen jargon)",
   "root_cause": "beschrijving van de oorzaak",
-  "root_cause_category": "webhook_delay|pipeline_error|timezone_mismatch|duplicate_email|late_completion|unknown",
+  "root_cause_category": "pipeline_error|timezone_mismatch|duplicate_email|late_completion|unknown",
+  "evidence": "welke specifieke BigQuery events of Firestore velden de conclusie onderbouwen. Schrijf 'Geen ondersteunende events gevonden' als dat zo is.",
+  "confidence": "high|medium|low",
   "resolution_possible": true|false,
   "resolution_method": "pipeline_event|firestore_direct|external_system|escalate",
   "resolution_description": "wat er gedaan moet worden om te herstellen",
@@ -197,6 +208,36 @@ def slack_chat_update(token: str, channel: str, ts: str, text: str) -> dict:
 
 def slack_dm_dennis(token: str, dennis_user_id: str, text: str) -> dict:
     return slack_post(token=token, channel=dennis_user_id, text=text)
+
+
+def send_dennis_investigation_report(
+    token: str, dennis_user_id: str,
+    task_doc_id: str, user_message: str,
+    events: list, diagnosis: dict, resolution_taken: str
+):
+    if events:
+        lines = [f"  • {e.get('received_at', '?')} – {e.get('event_type', '?')}" for e in events[:5]]
+        events_summary = f"{len(events)} events:\n" + "\n".join(lines)
+        if len(events) > 5:
+            events_summary += f"\n  … en {len(events) - 5} meer"
+    else:
+        events_summary = "Geen events gevonden in BigQuery — onderzoek waarom er geen event is aangemaakt (webhook niet gefired? pipeline dropped? bronsysteem?)"
+
+    confidence = diagnosis.get("confidence", "?")
+    root_cause_category = diagnosis.get("root_cause_category", "unknown")
+    evidence = diagnosis.get("evidence", "niet opgegeven")
+
+    report = (
+        f"*Diagnose rapport* — `{task_doc_id}`\n"
+        f"*Signaal:* {user_message}\n"
+        f"*BigQuery:* {events_summary}\n"
+        f"*Root cause:* `{root_cause_category}` — {diagnosis.get('root_cause', '')}\n"
+        f"*Bewijs:* {evidence}\n"
+        f"*Confidence:* {confidence}\n"
+        f"*Actie:* {resolution_taken}"
+    )
+    slack_dm_dennis(token=token, dennis_user_id=dennis_user_id, text=report)
+    log({"TO_SLACK_DENNIS_REPORT": {"task_doc_id": task_doc_id, "confidence": confidence, "root_cause_category": root_cause_category}})
 
 
 # ── FIRESTORE ─────────────────────────────────────────────────────────────────
@@ -839,6 +880,7 @@ def handle_task_investigation(
     resolution_possible = diagnosis.get("resolution_possible", False)
     resolution_method = diagnosis.get("resolution_method", "escalate")
     needs_dennis = diagnosis.get("needs_dennis_approval", True)
+    confidence = diagnosis.get("confidence", "low")
     employee_message_text = diagnosis.get("employee_message", "Er is iets misgegaan in de verwerking.")
 
     update_session(session_doc_id, {
@@ -860,12 +902,20 @@ def handle_task_investigation(
     resolution = None
     approved_by = None
 
-    if resolution_possible and not needs_dennis and resolution_method in ("pipeline_event", "firestore_direct"):
+    can_auto_resolve = (
+        resolution_possible
+        and not needs_dennis
+        and confidence == "high"
+        and resolution_method in ("pipeline_event", "firestore_direct")
+    )
+
+    if can_auto_resolve:
+        # Fix identified with high confidence — apply autonomously, then inform Dennis.
         if resolution_method == "pipeline_event":
             publish_correction_event(tenant_id, task_data, task_doc_id)
             resolution = "Correctie-event gepubliceerd via pipeline + taak voltooid"
         else:
-            resolution = "Taak direct voltooid"
+            resolution = "Taak direct voltooid in Firestore"
 
         complete_task(task_doc_id, task_data, slack_token)
         approved_by = "agent"
@@ -886,25 +936,49 @@ def handle_task_investigation(
             ])
         })
 
-    else:
-        escalation_summary = diagnosis.get("escalation_summary", root_cause)
-        escalation_message = (
-            f"⚠️ *Escalatie foutonderzoek*\n"
-            f"Taak: `{task_doc_id}`\n"
-            f"Signaal: {user_message}\n"
-            f"Onderzocht: {', '.join(investigation_steps)}\n"
-            f"Gevonden: {root_cause}\n"
-            f"Voorstel: {escalation_summary}"
+        send_dennis_investigation_report(
+            token=slack_token, dennis_user_id=dennis_user_id,
+            task_doc_id=task_doc_id, user_message=user_message,
+            events=events, diagnosis=diagnosis,
+            resolution_taken=f"✅ Autonoom opgelost — {resolution}"
         )
-        slack_dm_dennis(token=slack_token, dennis_user_id=dennis_user_id, text=escalation_message)
-        resolution = f"Geëscaleerd naar Dennis: {escalation_summary}"
+
+    elif resolution_possible:
+        # Fix identified but requires Dennis approval before applying.
+        fix_proposal = diagnosis.get("resolution_description") or diagnosis.get("escalation_summary") or root_cause
+        resolution = f"Voorstel ter goedkeuring: {fix_proposal}"
         approved_by = "dennis"
-        log({"TO_SLACK_ESCALATION": {"dennis_user_id": dennis_user_id}})
+        log({"TO_DENNIS_APPROVAL_REQUESTED": {"task_doc_id": task_doc_id}})
 
         update_session(session_doc_id, {
             "status": "awaiting_dennis_approval",
             "error_log_doc_id": error_log_doc_id
         })
+
+        send_dennis_investigation_report(
+            token=slack_token, dennis_user_id=dennis_user_id,
+            task_doc_id=task_doc_id, user_message=user_message,
+            events=events, diagnosis=diagnosis,
+            resolution_taken=f"⚠️ Goedkeuring gevraagd — {fix_proposal}"
+        )
+
+    else:
+        # No fix possible — investigation complete, inform Dennis of the situation.
+        resolution = f"Geen fix mogelijk: {root_cause or 'oorzaak onbekend'}"
+        approved_by = None
+        log({"TO_DENNIS_INFORMED": {"task_doc_id": task_doc_id}})
+
+        update_session(session_doc_id, {
+            "status": "resolved",
+            "error_log_doc_id": error_log_doc_id
+        })
+
+        send_dennis_investigation_report(
+            token=slack_token, dennis_user_id=dennis_user_id,
+            task_doc_id=task_doc_id, user_message=user_message,
+            events=events, diagnosis=diagnosis,
+            resolution_taken=f"ℹ️ Onderzoek afgerond — geen automatische fix mogelijk: {root_cause or 'oorzaak onbekend'}"
+        )
 
     write_error_log(error_log_doc_id, {
         "tenant_id": tenant_id,
