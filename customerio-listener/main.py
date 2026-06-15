@@ -500,6 +500,8 @@ def handle_task_followup_requested_event(envelope, site_id, api_key):
         "note": payload.get("note"),
         "original_task_doc_id": payload.get("original_task_doc_id"),
         "original_task": payload.get("original_task"),
+        "email": email,
+        "customer_id": customer_id,
     }.items() if v is not None}
 
     log_json("TASK_FOLLOWUP_REQUESTED", {"customer_id": customer_id, "email": email, "event_data": event_data})
