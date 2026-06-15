@@ -522,7 +522,7 @@ def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_
         "tenant_id": tenant_id,
         "event_type": event_type,
         "received_at": datetime.now(timezone.utc).isoformat(),
-        "customer_id": task_data.get("customer_id"),
+        "customer_id": task_data.get("customer_id") or task_data.get("email"),
         "email": task_data.get("email"),
         "payload": {
             "task_type": task_data.get("task_type"),
