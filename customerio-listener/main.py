@@ -249,6 +249,7 @@ def convert_payload_datetimes_to_epoch(data):
         'last_visit',
         'next_appointment_at',
         'next_checkin_at',
+        'followup_date',
         'last_visit_plus_14d',
         'last_visit_plus_21d',
         'last_visit_plus_28d',

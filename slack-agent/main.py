@@ -514,7 +514,6 @@ def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_
         "customer_id": task_data.get("customer_id"),
         "email": task_data.get("email"),
         "payload": {
-            "task_doc_id": task_doc_id,
             "task_type": task_data.get("task_type"),
             **(extra_payload or {})
         }
@@ -583,7 +582,8 @@ def handle_followup_requested(
     publish_task_event(tenant_id, task_doc_id, task_data, "task_followup_requested", {
         "followup_date": followup_date,
         "note": user_message,
-        "original_task_doc_id": task_doc_id
+        "original_task_doc_id": task_doc_id,
+        "original_task": task_data
     })
     reply = f"Begrepen — ik plan een nieuwe taak op {followup_readable}."
     slack_post(token=slack_token, channel=channel_id, text=reply, thread_ts=thread_ts)
