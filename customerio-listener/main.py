@@ -506,13 +506,11 @@ def handle_task_followup_requested_event(envelope, site_id, api_key):
 
     log_json("TASK_FOLLOWUP_REQUESTED", {"customer_id": customer_id, "email": email, "event_data": event_data})
 
-    if customer_id:
-        return track_event(site_id, api_key, customer_id, "task_followup_requested", event_data)
-    elif email:
-        return track_anonymous_event(site_id, api_key, email, "task_followup_requested", event_data)
-    else:
+    identifier = customer_id or email
+    if not identifier:
         print("task_followup_requested missing both customer_id and email")
         return None
+    return track_event(site_id, api_key, identifier, "task_followup_requested", event_data)
 
 
 def handle_customer_update_event(envelope, site_id, api_key):
