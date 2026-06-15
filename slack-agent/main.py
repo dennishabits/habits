@@ -505,6 +505,17 @@ def publish_correction_event(tenant_id: str, task_data: dict, task_doc_id: str):
 
 # ── TASK LIFECYCLE EVENTS ────────────────────────────────────────────────────
 
+def _task_template(task_data: dict) -> dict:
+    return {k: v for k, v in {
+        "task_type": task_data.get("task_type"),
+        "action_type": task_data.get("action_type"),
+        "valid_minutes": task_data.get("valid_minutes"),
+        "task_title": task_data.get("task_title"),
+        "task_icon": task_data.get("task_icon"),
+        "task_label": task_data.get("task_label"),
+    }.items() if v is not None}
+
+
 def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_type: str, extra_payload: dict = None):
     envelope = {
         "webhook_source": "slack-agent",
@@ -583,7 +594,7 @@ def handle_followup_requested(
         "followup_date": followup_date,
         "note": user_message,
         "original_task_doc_id": task_doc_id,
-        "original_task": task_data
+        "original_task": _task_template(task_data)
     })
     reply = f"Begrepen — ik plan een nieuwe taak op {followup_readable}."
     slack_post(token=slack_token, channel=channel_id, text=reply, thread_ts=thread_ts)
