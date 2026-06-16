@@ -616,11 +616,17 @@ def handle_followup_requested(
         "outcome": "followup_planned",
         "note": note
     })
+    original_payload = task_data.get("payload", {})
     publish_task_event(tenant_id, task_doc_id, task_data, "task_followup_requested", {
         "followup_date": followup_date,
         "note": note,
         "original_task_doc_id": task_doc_id,
-        "original_task": _task_template(task_data)
+        **_task_template(task_data),
+        **{k: v for k, v in {
+            "product_interest": original_payload.get("product_interest"),
+            "utm_medium": original_payload.get("utm_medium"),
+            "utm_source": original_payload.get("utm_source"),
+        }.items() if v is not None},
     })
     reply = f"Begrepen — ik plan een nieuwe taak op {followup_readable}."
     slack_post(token=slack_token, channel=channel_id, text=reply, thread_ts=thread_ts)
