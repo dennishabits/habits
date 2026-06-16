@@ -128,6 +128,18 @@ Geef een JSON object terug:
 """
 
 
+FOLLOWUP_NOTE_PROMPT = """
+Je schrijft een korte briefing voor een instructeur die een geplande follow-up taak oppakt.
+
+Je krijgt berichten uit de Slack-thread van de oorspronkelijke taak, plus de datum waarop de follow-up is ingepland.
+
+Schrijf 2-3 zinnen in het Nederlands, vanuit het perspectief van iemand die de follow-up oppakt op die datum. Gebruik de verleden tijd voor wat er eerder is besproken ("heeft contact gehad", "zou verhuisd zijn"). Vermeld wat er besproken is, wat de situatie was, en wat de afspraak was. Houd het feitelijk en beknopt — geen aanspreekvormen, geen groeten.
+
+Geef ALLEEN een JSON object terug, geen andere tekst:
+{"note": "de briefing tekst"}
+"""
+
+
 DATE_EXTRACTION_PROMPT = """
 Je bent een datum-extractie-assistent. Extraheer een concrete vervolgdatum uit een Nederlands bericht.
 
@@ -542,6 +554,17 @@ def extract_followup_date(message: str) -> dict:
     return result
 
 
+def generate_followup_note(conversation: list, user_message: str, followup_readable: str) -> str:
+    employee_messages = [m["content"] for m in (conversation or []) if m.get("role") == "employee"]
+    all_messages = employee_messages + ([user_message] if user_message not in employee_messages else [])
+    context = "\n".join(f"- {m}" for m in all_messages)
+    user_content = f"Follow-up datum: {followup_readable}\n\nBerichten uit de thread:\n{context}"
+    result = call_gemini_json(FOLLOWUP_NOTE_PROMPT, user_content)
+    note = result.get("note")
+    log({"FOLLOWUP_NOTE_GENERATED": {"note": note}})
+    return note or "\n".join(all_messages)
+
+
 def handle_negative_outcome(
     tenant_id: str, tenant: dict, channel_id: str, thread_ts: str,
     user_message: str, session_doc_id: str, task_doc_id: str, task_data: dict, now: str
@@ -586,10 +609,7 @@ def handle_followup_requested(
         log({"FOLLOWUP_DATE_EXTRACTION_FAILED": {"session_doc_id": session_doc_id}})
         return
 
-    # Combine all employee messages from the thread so the note includes full context,
-    # not just the message that triggered the followup classification.
-    prior_context = [m["content"] for m in (conversation or []) if m.get("role") == "employee"]
-    note = "\n".join(prior_context + [user_message]) if prior_context else user_message
+    note = generate_followup_note(conversation, user_message, followup_readable)
 
     complete_task(task_doc_id, task_data, slack_token, label=f"Terugbellen {followup_readable}")
     publish_task_event(tenant_id, task_doc_id, task_data, "task_completed", {
