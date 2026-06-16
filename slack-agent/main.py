@@ -565,7 +565,8 @@ def handle_negative_outcome(
 
 def handle_followup_requested(
     tenant_id: str, tenant: dict, channel_id: str, thread_ts: str,
-    user_message: str, session_doc_id: str, task_doc_id: str, task_data: dict, now: str
+    user_message: str, session_doc_id: str, task_doc_id: str, task_data: dict, now: str,
+    conversation: list = None
 ):
     slack_token = tenant.get("slack_bot_token")
     date_result = extract_followup_date(user_message)
@@ -585,14 +586,19 @@ def handle_followup_requested(
         log({"FOLLOWUP_DATE_EXTRACTION_FAILED": {"session_doc_id": session_doc_id}})
         return
 
+    # Combine all employee messages from the thread so the note includes full context,
+    # not just the message that triggered the followup classification.
+    prior_context = [m["content"] for m in (conversation or []) if m.get("role") == "employee"]
+    note = "\n".join(prior_context + [user_message]) if prior_context else user_message
+
     complete_task(task_doc_id, task_data, slack_token, label=f"Terugbellen {followup_readable}")
     publish_task_event(tenant_id, task_doc_id, task_data, "task_completed", {
         "outcome": "followup_planned",
-        "note": user_message
+        "note": note
     })
     publish_task_event(tenant_id, task_doc_id, task_data, "task_followup_requested", {
         "followup_date": followup_date,
-        "note": user_message,
+        "note": note,
         "original_task_doc_id": task_doc_id,
         "original_task": _task_template(task_data)
     })
@@ -698,7 +704,8 @@ def handle_task_investigation(
             task_data = task_doc.to_dict() if task_doc and task_doc.exists else {}
             handle_followup_requested(
                 tenant_id, tenant, channel_id, thread_ts, user_message,
-                session_doc_id, task_doc_id, task_data, now
+                session_doc_id, task_doc_id, task_data, now,
+                conversation=session.get("conversation", [])
             )
             return
 
@@ -765,7 +772,7 @@ def handle_task_investigation(
             task_doc = fs_client.collection("slack_messages").document(task_doc_id).get() if task_doc_id else None
             task_data = task_doc.to_dict() if task_doc and task_doc.exists else {}
             update_session(session_doc_id, {"status": "resolving"})
-            handle_followup_requested(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now)
+            handle_followup_requested(tenant_id, tenant, channel_id, thread_ts, user_message, session_doc_id, task_doc_id, task_data, now, conversation=session.get("conversation", []))
             return
 
         if signal_type == "followup_vague":
