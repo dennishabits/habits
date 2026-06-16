@@ -504,12 +504,18 @@ def handle_task_followup_requested_event(envelope, site_id, api_key):
         "customer_id": customer_id,
     }.items() if v is not None}
 
-    log_json("TASK_FOLLOWUP_REQUESTED", {"customer_id": customer_id, "email": email, "event_data": event_data})
-
     identifier = customer_id or email
     if not identifier:
         print("task_followup_requested missing both customer_id and email")
         return None
+
+    log_json("TASK_FOLLOWUP_REQUESTED", {"identifier": identifier, "email": email, "event_data": event_data})
+
+    # For email-identified leads (no numeric Sportivity ID), ensure the customer
+    # exists in CIO with their email as identifier and attribute before tracking.
+    if is_email_address(identifier) and email:
+        create_or_update_customer(site_id, api_key, {"email": email}, email, "update")
+
     return track_event(site_id, api_key, identifier, "task_followup_requested", event_data)
 
 
