@@ -464,13 +464,20 @@ def call_gemini_json(system_prompt: str, user_message: str) -> dict:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[{"role": "user", "parts": [{"text": user_message}]}],
-        config={"system_instruction": system_prompt}
+        config={"system_instruction": system_prompt, "response_mime_type": "application/json"}
     )
     raw = response.text.strip() if response.text else "{}"
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        import re
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
         log({"GEMINI_JSON_PARSE_ERROR": {"raw": raw[:200]}})
         return {}
 
@@ -1352,6 +1359,17 @@ def handle_task_investigation(
         investigation_steps.append("bigquery")
         diagnosis = investigate_discrepancy(task_data, events, user_message)
         staged_findings = None
+
+    if not diagnosis:
+        error_text = "Er is een technisch probleem opgetreden bij het analyseren. Probeer het opnieuw."
+        slack_post(token=slack_token, channel=channel_id, text=error_text, thread_ts=thread_ts)
+        update_session(session_doc_id, {
+            "status": "investigating",
+            "conversation": firestore.ArrayUnion([
+                {"role": "agent", "content": error_text, "timestamp": datetime.now(timezone.utc).isoformat()}
+            ])
+        })
+        return
 
     root_cause = diagnosis.get("root_cause", "")
     root_cause_category = diagnosis.get("root_cause_category", "unknown")
