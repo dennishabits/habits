@@ -1181,7 +1181,7 @@ def handle_task_investigation(
                 task_doc_check = fs_client.collection("slack_messages").document(task_doc_id_check).get()
                 if task_doc_check.exists:
                     td = task_doc_check.to_dict()
-                    if not td.get("completed", False) and not td.get("expired", False):
+                    if not td.get("completed", False):
                         task_is_open = True
             if not task_is_open:
                 log({"SESSION_ALREADY_RESOLVED": {"session_doc_id": session_doc_id}})
