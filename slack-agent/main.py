@@ -1034,12 +1034,12 @@ def investigate_discrepancy_appointment(
 
     if not stage_a.get("found"):
         if stage_a.get("skipped"):
-            employee_msg = "We kunnen het bronsysteem niet bereiken om dit te controleren — Dennis bekijkt het."
+            employee_msg = "We kunnen de afspraken niet controleren op dit moment. Melding gemaakt van het probleem."
             category = "unknown"
             confidence = "low"
             root_cause = "Acuity niet geconfigureerd voor deze tenant — Stage A overgeslagen"
         elif stage_a.get("error"):
-            employee_msg = "Er is een technisch probleem bij het controleren van de afspraak — Dennis bekijkt het."
+            employee_msg = "Er is een technisch probleem bij het controleren van de afspraak. Melding gemaakt van het probleem."
             category = "unknown"
             confidence = "low"
             root_cause = f"Stage A mislukt door technische fout: {stage_a['error']}"
@@ -1079,7 +1079,7 @@ def investigate_discrepancy_appointment(
             "resolution_possible": False,
             "resolution_method": "escalate",
             "resolution_description": "Account-merge vereist in Sportivity en/of Customer.io — Dennis beslist over de aanpak",
-            "employee_message": "Er lijkt een dubbel account te zijn voor dit lid. Dennis lost dit op.",
+            "employee_message": "We zien de afspraak staan in Acuity, maar er lijkt een verschil in gegevens te zitten tussen de systemen. Melding gemaakt van het probleem.",
             "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": None}
         }
 
@@ -1110,7 +1110,7 @@ def investigate_discrepancy_appointment(
             "resolution_possible": False,
             "resolution_method": "escalate",
             "resolution_description": f"Pipeline drop bij '{drop_stage}' — Dennis onderzoekt de oorzaak en bepaalt replay-strategie",
-            "employee_message": "De afspraak staat ingepland, maar is ergens in de koppeling vastgelopen. Dennis pakt dit op.",
+            "employee_message": "We zien de afspraak staan in Acuity, maar hebben deze hier niet ontvangen. Melding gemaakt van het probleem.",
             "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
         }
 
@@ -1125,7 +1125,7 @@ def investigate_discrepancy_appointment(
         "resolution_possible": False,
         "resolution_method": "escalate",
         "resolution_description": "Handmatig onderzoek door Dennis — alle systemen tonen de afspraak maar de taak is niet gesloten",
-        "employee_message": "We zien de afspraak staan, maar kunnen de verwerking niet volledig traceren. Dennis bekijkt het.",
+        "employee_message": "We zien de afspraak staan in Acuity, maar kunnen niet achterhalen waar de verwerking is gestopt. Melding gemaakt van het probleem.",
         "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
     }
 
