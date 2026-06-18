@@ -44,6 +44,12 @@ Een item op de backlog is geen commitment. Het is een vastgelegd idee met genoeg
 **Context**: Customer.io heeft een MCP server aangekondigd die de volledige Agent-kracht krijgt. Nu al bruikbaar via de App API voor broadcasts en templates.
 **Afhankelijkheden**: Customer.io MCP server volledig uitgerold.
 
+### slack-agent Stage 2: remediatie na appointment-diagnoses
+**Categorie**: feature
+**Waarde**: sluit de feedbackloop die Stage 1 opent — diagnoses worden vertrouwd en de agent kan autonoom of semi-autonoom herstellen afhankelijk van de root cause.
+**Context**: Stage 1 (deployed 2026-06-18) produceert voor `action_type == "appointment"` een diagnose via Acuity (Stage A), identiteitsreconciliatie (Stage B) en pipeline log-walk (Stage C), maar neemt geen corrigerende actie. Stage 2 voegt remediatie toe per root cause: `appointment_not_in_source` → eerlijke afsluiting met melding aan medewerker; `identity_mismatch` → escalatie naar Dennis voor account-merge; `pipeline_drop_{stage}` → replay-strategie bepalen en uitvoeren. Remediatie mag pas worden ingeschakeld als de diagnoses op live threads vertrouwd zijn gebleken.
+**Afhankelijkheden**: voldoende live Stage 1 diagnoses om patronen te valideren; akkoord Dennis per remediatie-type.
+
 ### Automatisch e-mailadres corrigeren in Acuity via slack-agent
 **Categorie**: feature
 **Waarde**: sluit de feedbackloop bij onbekende e-mailadressen — de agent detecteert de discrepantie, zoekt het juiste e-mailadres op via telefoon-lookup in BigQuery, en past het e-mailadres in Acuity aan via de API na akkoord van de medewerker in de Slack-thread.

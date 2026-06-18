@@ -115,12 +115,20 @@ Pure `@mention` berichten worden afgevangen vóór de Gemini-aanroep (pre-filter
 
 Het onderzoek is gelaagd. De agent stopt zodra de root cause gevonden is.
 
+**Voor `action_type == "appointment"` (member_talk, fitcheck, evaluation, followup_appointment):**
+
+Drie geordende stages — elke stage is alleen conclusief als het bewijs aanwezig is. Stop zodra een stage een oorzaak oplevert.
+
+1. **Stage A — Acuity bronwaarheid**: bevraag de Acuity API op actieve afspraken voor het e-mailadres van de klant. Als er geen afspraak bestaat → de medewerker heeft zich vergist of de afspraak staat onder een ander e-mailadres. Sla het `createdAt`-tijdstip op als anker voor Stage C.
+2. **Stage B — Identiteitsreconciliatie**: vergelijk het e-mailadres behorend bij het `customer_id` in Sportivity en Customer.io met het e-mailadres in de taak. Een verschil duidt op een dubbel account dat de pipeline-matching verstoort.
+3. **Stage C — Pipeline log-walk**: doorloop de stages `webhook-dispatcher → acuity-enricher → acuity-translator → bigquery-listener → customerio-listener` via Cloud Logging, verankerd op het `createdAt`-tijdstip van de afspraak (niet `created_at` van de taak). De eerste stage zonder logvermelding is het drop-punt.
+
+**Voor alle andere `action_type` waarden:**
+
 1. **Firestore** — taakstate, action_type, customer_id, email, created_at, expired, completed
 2. **BigQuery** — events rondom die taak in het relevante tijdvenster (completion events, expiry events)
-3. **GCS logs** — alleen als stap 1 en 2 geen antwoord geven
-4. **Bronsysteem** (Acuity, Sportivity, Customer.io) — alleen bij datakwaliteitsproblemen
 
-De agent raadpleegt Firestore (`tenants/{tenant_id}`) om te bepalen welke externe systemen actief zijn voor deze tenant voordat hij bronsystemen benadert.
+De agent raadpleegt Firestore (`tenants/{tenant_id}`) en het `enabledServices` veld om te bepalen welke externe systemen actief zijn voor deze tenant voordat hij bronsystemen benadert.
 
 ### Herstelproces
 
@@ -132,6 +140,8 @@ De agent herstelt autonoom wanneer de root cause duidelijk is en de actie geen n
 3. **`external_system`** of onbekende root cause — escaleer naar Dennis
 
 Na autonoom herstel wordt de medewerker gevraagd te bevestigen ("De taak is nu correct verwerkt — klopt dit?"). Bij bevestiging wordt `employee_confirmed: true` gezet in de foutlog.
+
+**Uitzondering — `action_type == "appointment"` (Stage 1):** herstel is uitgeschakeld. De staged investigation produceert altijd een diagnose met `resolution_possible: false` en `needs_dennis_approval: true`. De agent rapporteert de bevindingen aan de medewerker en Dennis, maar onderneemt geen corrigerende actie. Remediatie wordt toegevoegd in Stage 2 zodra diagnoses vertrouwd zijn op live threads.
 
 Systeemwijzigingen (code, deployment) vereisen altijd akkoord van Dennis.
 Acties in externe systemen (Acuity e-mailadres, Customer.io merge) vereisen altijd akkoord van Dennis.
@@ -185,11 +195,12 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 | `signal_type` | string | `discrepancy`, `operational`, `unclear`, `irrelevant` |
 | `investigation_steps` | array | Welke bronnen zijn geraadpleegd in volgorde |
 | `root_cause` | string | Vastgestelde oorzaak |
-| `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `unknown` |
+| `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `appointment_not_in_source`, `identity_mismatch`, `pipeline_drop_webhook_dispatcher`, `pipeline_drop_acuity_enricher`, `pipeline_drop_acuity_translator`, `pipeline_drop_bigquery_listener`, `pipeline_drop_customerio_listener`, `unknown` |
 | `resolution` | string | Welke actie is uitgevoerd |
 | `resolution_method` | string | `pipeline_event`, `firestore_direct`, `external_system`, `escalated` |
 | `approved_by` | string | `agent` (autonoom) of `dennis` (na akkoord) |
 | `employee_confirmed` | boolean | Heeft de medewerker bevestigd dat het klopt |
+| `staged_findings` | dict \| null | Stage A/B/C resultaten voor appointment-discrepanties — `{stage_a, stage_b, stage_c}`; null voor andere action types |
 | `created_at` | timestamp | Moment van signaal |
 | `resolved_at` | timestamp | Moment van afsluiting |
 
