@@ -64,6 +64,18 @@ Een item op de backlog is geen commitment. Het is een vastgelegd idee met genoeg
 **Context**: Habits koppelt vier systemen: Sportivity (bron van waarheid voor klantdata), Acuity (afspraken), Customer.io (marketing automation) en BigQuery (analyse). Datakwaliteitsproblemen — zoals een klant met twee e-mailadressen — ontstaan onvermijdelijk door de indirecte koppeling tussen die systemen. De agent moet in staat zijn om: (1) de root cause te traceren via BigQuery-lookup, (2) het juiste e-mailadres op te halen uit Sportivity, (3) het aan te passen in Acuity via `PATCH /appointments/{id}`, (4) een dubbel profiel te detecteren in Customer.io via de App API, en (5) profielen te mergen via `POST /api/v1/merge_customers` na akkoord. Alle destructieve stappen (merge, delete) vereisen expliciete bevestiging via de Slack-thread.
 **Afhankelijkheden**: `slack-agent` service; Customer.io App API access.
 
+### Acuity reconciliatie-job
+**Categorie**: feature
+**Waarde**: voorkomt permanent verlies van afsprakentaken als een Acuity-webhook niet aankomt — zonder dat een medewerker de discrepantie hoeft te melden. Sluit afsprakentaken autonoom af zodra Acuity de afspraak bevestigt maar de pipeline deze nooit ontving.
+**Context**: geïdentificeerd op 2026-06-18 via staged investigation (`pipeline_drop_webhook_dispatcher`). De `slack-agent` detecteert nu per geval dat een Acuity-webhook niet is ontvangen, maar heeft geen structurele fallback. De oplossing is een periodieke job (Cloud Scheduler + Cloud Function) die:
+1. Alle open appointment-taken (`action_type: appointment`) in Firestore ophaalt die ouder zijn dan X uur (`created_at < now - Xh`, `completed: false`, `expired: false`)
+2. Voor elke taak de Acuity API bevraagt op het e-mailadres van het lid
+3. Als Acuity een afspraak bevestigt die de pipeline nooit ontving: sluit de taak autonoom via een synthetisch completion-event
+4. Logt gevonden discrepanties naar BigQuery voor patroonherkenning
+
+Prioritering op basis van `pipeline_drop_count` in `error_log`: zodra >5 totale occurrences of ≥2 verschillende dagen gedetecteerd → structurele aanpak verplicht. De `slack-agent` signaleert dit actief aan Dennis en aan de medewerker in de thread.
+**Afhankelijkheden**: Acuity API toegang (al beschikbaar via `acuity-enricher`); Cloud Scheduler job (vereist goedkeuring Dennis).
+
 ### Sportivity reconciliatie-job
 **Categorie**: feature
 **Waarde**: voorkomt permanent verlies van `subscription_update` events als Sportivity een webhook stuurt terwijl de pipeline tijdelijk down is. Sportivity herprobeert webhooks niet — als het bericht het `sportivity-enricher` niet bereikt, bestaat er geen herstelmechanisme. De DLQ helpt alleen voor berichten die al in Pub/Sub zitten; dit gaat over berichten die nooit aankomen.

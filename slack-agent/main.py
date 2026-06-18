@@ -394,6 +394,33 @@ def complete_task(task_doc_id: str, task_data: dict, slack_token: str, label: st
     log({"TO_FIRESTORE_TASK_COMPLETED": {"doc_id": task_doc_id, "visitor_name": visitor_name, "label": label}})
 
 
+def count_pipeline_drop_occurrences(tenant_id: str) -> tuple:
+    """Returns (total_count, distinct_day_count) for all pipeline_drop_* events for this tenant."""
+    try:
+        docs = fs_client.collection("error_log") \
+            .where(filter=firestore.FieldFilter("tenant_id", "==", tenant_id)) \
+            .stream()
+        days = set()
+        total = 0
+        for doc in docs:
+            data = doc.to_dict()
+            if not data.get("root_cause_category", "").startswith("pipeline_drop"):
+                continue
+            total += 1
+            created_at = data.get("created_at")
+            if hasattr(created_at, "date"):
+                days.add(created_at.date())
+            elif created_at:
+                try:
+                    days.add(datetime.fromisoformat(str(created_at)).date())
+                except Exception:
+                    pass
+        return total, len(days)
+    except Exception as e:
+        log({"PIPELINE_DROP_COUNT_ERROR": str(e)})
+        return 0, 0
+
+
 def write_error_log(doc_id: str, data: dict):
     fs_client.collection("error_log").document(doc_id).set(data)
     log({"TO_FIRESTORE_ERROR_LOG": {"doc_id": doc_id}})
@@ -1379,6 +1406,25 @@ def handle_task_investigation(
     confidence = diagnosis.get("confidence", "low")
     employee_message_text = diagnosis.get("employee_message", "Er is iets misgegaan in de verwerking.")
 
+    # Patroondetectie voor pipeline_drop — communiceer herhaling aan medewerker en Dennis
+    pipeline_drop_prev_count = 0
+    pipeline_drop_prev_days = 0
+    is_recurring_pipeline_drop = False
+    if root_cause_category.startswith("pipeline_drop"):
+        pipeline_drop_prev_count, pipeline_drop_prev_days = count_pipeline_drop_occurrences(tenant_id)
+        total_with_current = pipeline_drop_prev_count + 1
+        is_recurring_pipeline_drop = total_with_current > 5 or pipeline_drop_prev_days >= 2
+        if is_recurring_pipeline_drop:
+            employee_message_text = (
+                f"{employee_message_text} "
+                f"Dit probleem is al {total_with_current} keer opgetreden — we pakken dit structureel op."
+            )
+        log({"PIPELINE_DROP_PATTERN": {
+            "total_with_current": total_with_current,
+            "distinct_days": pipeline_drop_prev_days,
+            "is_recurring": is_recurring_pipeline_drop
+        }})
+
     update_session(session_doc_id, {
         "diagnosis": diagnosis,
         "resolution_method": resolution_method,
@@ -1492,9 +1538,25 @@ def handle_task_investigation(
         "approved_by": approved_by,
         "employee_confirmed": False,
         "staged_findings": staged_findings,
+        "pipeline_drop_count": (pipeline_drop_prev_count + 1) if root_cause_category.startswith("pipeline_drop") else None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "resolved_at": datetime.now(timezone.utc).isoformat() if approved_by == "agent" else None
     })
+
+    if is_recurring_pipeline_drop:
+        total_with_current = pipeline_drop_prev_count + 1
+        slack_dm_dennis(
+            token=slack_token, dennis_user_id=dennis_user_id,
+            text=(
+                f"⚠️ Patroon gedetecteerd: `{root_cause_category}` is nu *{total_with_current}x* "
+                f"opgetreden over *{pipeline_drop_prev_days} dag(en)*. "
+                f"Drempel voor structurele aanpak bereikt — zie backlog: *Acuity reconciliatie-job*."
+            )
+        )
+        log({"TO_DENNIS_PIPELINE_DROP_PATTERN": {
+            "total": total_with_current,
+            "days": pipeline_drop_prev_days
+        }})
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────

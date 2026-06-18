@@ -194,6 +194,7 @@ Ontbreekt: [waarom de oorzaak nog onduidelijk is]
 5. **Elke actie is herleidbaar** — alles wordt gelogd in `error_log` en `agent_sessions`
 6. **Escaleer bij vastlopen** — na twee stappen zonder antwoord, of bij `external_system` / onbekende root cause
 7. **Twijfel? Vraag terug** — één contextuele vraag gegenereerd door Gemini, nooit aannames
+8. **Patroon → structurele vlag** — bij elke `pipeline_drop_*` diagnose telt de agent het historisch aantal occurrences voor deze tenant (`pipeline_drop_count` in `error_log`). Als het totaal >5 of de occurrences ≥2 verschillende dagen beslaan: informeer de medewerker dat het probleem vaker voorkomt en dat een structurele oplossing wordt opgepakt; stuur Dennis een DM met het patroon en een verwijzing naar de *Acuity reconciliatie-job* in de backlog.
 
 ---
 
@@ -219,6 +220,7 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 | `approved_by` | string | `agent` (autonoom) of `dennis` (na akkoord) |
 | `employee_confirmed` | boolean | Heeft de medewerker bevestigd dat het klopt |
 | `staged_findings` | dict \| null | Stage A/B/C resultaten voor appointment-discrepanties — `{stage_a, stage_b, stage_c}`; null voor andere action types |
+| `pipeline_drop_count` | int \| null | Cumulatief aantal `pipeline_drop_*` events voor deze tenant t/m en met dit event; null voor andere categorieën |
 | `created_at` | timestamp | Moment van signaal |
 | `resolved_at` | timestamp | Moment van afsluiting |
 

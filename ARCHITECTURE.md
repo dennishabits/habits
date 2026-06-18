@@ -245,6 +245,7 @@ action_type      — bepaalt completion-logica: 'contact', 'appointment', 'subsc
 |---|---|---|
 | Pipeline log-walking zonder trace-ID | Stage C (staged investigation) doorzoekt Cloud Logging per service op `customer_id`/email. Werkt voor incidenteel gebruik; schaalt niet bij hoog volume. Structurele fix: trace-ID-propagatie door de pipeline. | Technische schuld — geen backlog-item |
 | Sportivity herprobeert webhooks niet | Bij pipeline-downtime gaat een Sportivity-webhook permanent verloren. DLQ helpt alleen voor berichten die al in Pub/Sub zitten. | Zie BACKLOG.md: *Sportivity reconciliatie-job* |
+| Acuity herprobeert webhooks niet | Zelfde patroon als Sportivity. Bij gemiste Acuity-webhook wordt een afsprakentaak nooit afgesloten. Gedetecteerd op 2026-06-18 via `pipeline_drop_webhook_dispatcher`. De `slack-agent` telt occurrences; bij >5 totaal of ≥2 dagen signaleert de agent actief aan Dennis. | Zie BACKLOG.md: *Acuity reconciliatie-job* |
 | Proliferatie van agent-services | `habits-coach-reply` en `slack-agent` volgen hetzelfde basispatroon in aparte services. Zonder ingreep groeit het aantal agent-services lineair met het aantal processen. | Zie BACKLOG.md: *Eén configureerbare slack-agent* |
 | Identiteitsassumpties in de pipeline | De pipeline keyt op `customer_id` of `email`. Bij een klant met meerdere e-mailadressen valt completion-matching stil. Stage 1 detecteert dit; geautomatiseerd herstel ontbreekt nog. | Zie BACKLOG.md: *Integratieagent* |
 
