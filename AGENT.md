@@ -135,9 +135,9 @@ Het onderzoek is gelaagd. De agent stopt zodra de root cause gevonden is.
 
 Drie geordende stages — elke stage is alleen conclusief als het bewijs aanwezig is. Stop zodra een stage een oorzaak oplevert.
 
-1. **Stage A — Acuity bronwaarheid**: bevraag de Acuity API op actieve afspraken voor het e-mailadres van de klant. Als er geen afspraak bestaat → de medewerker heeft zich vergist of de afspraak staat onder een ander e-mailadres. Sla het `createdAt`-tijdstip op als anker voor Stage C.
-2. **Stage B — Identiteitsreconciliatie**: vergelijk het e-mailadres behorend bij het `customer_id` in Sportivity en Customer.io met het e-mailadres in de taak. Een verschil duidt op een dubbel account dat de pipeline-matching verstoort.
-3. **Stage C — Pipeline log-walk**: doorloop de stages `webhook-dispatcher → acuity-enricher → acuity-translator → bigquery-listener → customerio-listener` via Cloud Logging, verankerd op het `createdAt`-tijdstip van de afspraak (niet `created_at` van de taak). De eerste stage zonder logvermelding is het drop-punt.
+1. **Stage A — Acuity bronwaarheid**: bevraag de Acuity API op actieve afspraken voor het e-mailadres van de klant. Als er geen afspraak bestaat → de medewerker heeft zich vergist of de afspraak staat onder een ander e-mailadres. Sla het `datetimeCreated`-tijdstip op als anker voor Stage C.
+2. **Stage B — Identiteitsreconciliatie**: bevraag de `customers` tabel in BigQuery op klanten met dezelfde naam maar een afwijkend e-mailadres. Een duplicaat duidt op een dubbel account dat de pipeline-matching verstoort. Controleer welk account het actieve abonnement heeft. Zie de resolutieprocedure hieronder bij `identity_mismatch`.
+3. **Stage C — BigQuery pipeline-analyse**: bevraag `raw_events` op appointment-events voor het e-mailadres of `customer_id` van de klant. Controleer daarna de `appointments` view op hetzelfde e-mailadres of `customer_id`. Als de afspraak in `raw_events` staat maar niet in de `appointments` view, of als `customer_id = NULL` staat op het event (`is_known_customer = false`), is dat het drop-punt.
 
 **Voor alle andere `action_type` waarden:**
 
@@ -157,7 +157,13 @@ De agent herstelt autonoom wanneer de root cause duidelijk is en de actie geen n
 
 Na autonoom herstel wordt de medewerker gevraagd te bevestigen ("De taak is nu correct verwerkt — klopt dit?"). Bij bevestiging wordt `employee_confirmed: true` gezet in de foutlog.
 
-**Uitzondering — `action_type == "appointment"` (Stage 1):** herstel is uitgeschakeld. De staged investigation produceert altijd een diagnose met `resolution_possible: false` en `needs_dennis_approval: true`. De agent rapporteert de bevindingen aan de medewerker en Dennis, maar onderneemt geen corrigerende actie. Remediatie wordt toegevoegd in Stage 2 zodra diagnoses vertrouwd zijn op live threads.
+**Uitzondering — `action_type == "appointment"` (Stage 1):** herstel is uitgeschakeld voor de meeste diagnoses. De staged investigation produceert altijd een diagnose met `resolution_possible: false` en `needs_dennis_approval: true`. De agent rapporteert de bevindingen aan de medewerker en Dennis, maar onderneemt geen corrigerende actie. Remediatie wordt toegevoegd in Stage 2 zodra diagnoses vertrouwd zijn op live threads.
+
+**Uitzondering: `identity_mismatch` resolutieprocedure** — bij een geïdentificeerd dubbel account voert de agent de volgende stappen uit *na akkoord van Dennis*:
+1. Corrigeer het e-mailadres van de toekomstige afspraak in Acuity naar het e-mailadres van het actieve abonnement (`PUT /api/v1/appointments/{id}` met `{"email": "..."}`)
+2. Update `next_checkin_at`, `next_checkin_name`, `next_checkin_employee` handmatig in de `customers` tabel in BigQuery voor de actieve klant
+3. Sluit de taak af via Firestore + Slack (`completed: true`)
+4. Meld aan Dennis: het dubbele Sportivity-account kan **niet** via API worden verwijderd (405 Method Not Allowed) — handmatige actie in Sportivity UI vereist. Customer.io merge is **niet beschikbaar** op het huidige plan (404) — profielen blijven gescheiden.
 
 Systeemwijzigingen (code, deployment) vereisen altijd akkoord van Dennis.
 Acties in externe systemen (Acuity e-mailadres, Customer.io merge) vereisen altijd akkoord van Dennis.
@@ -214,7 +220,7 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 | `signal_type` | string | `discrepancy`, `operational`, `unclear`, `irrelevant` |
 | `investigation_steps` | array | Welke bronnen zijn geraadpleegd in volgorde |
 | `root_cause` | string | Vastgestelde oorzaak |
-| `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `appointment_not_in_source`, `identity_mismatch`, `pipeline_drop_webhook_dispatcher`, `pipeline_drop_acuity_enricher`, `pipeline_drop_acuity_translator`, `pipeline_drop_bigquery_listener`, `pipeline_drop_customerio_listener`, `unknown` |
+| `root_cause_category` | string | `timezone_mismatch`, `duplicate_email`, `late_completion`, `pipeline_error`, `appointment_not_in_source`, `identity_mismatch`, `unknown_customer_no_id` (afspraak binnengekomen met `is_known_customer = false` — `customer_id = NULL` in raw_events, scheduled query sloeg afspraak over voor `next_checkin_at`), `pipeline_drop_webhook_dispatcher`, `pipeline_drop_acuity_enricher`, `pipeline_drop_acuity_translator`, `pipeline_drop_bigquery_listener`, `pipeline_drop_customerio_listener`, `unknown` |
 | `resolution` | string | Welke actie is uitgevoerd |
 | `resolution_method` | string | `pipeline_event`, `firestore_direct`, `external_system`, `escalated` |
 | `approved_by` | string | `agent` (autonoom) of `dennis` (na akkoord) |
