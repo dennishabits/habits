@@ -7,17 +7,28 @@ from zoneinfo import ZoneInfo
 
 import requests
 from google.cloud import bigquery, firestore, pubsub_v1
+from google.cloud import logging as gcp_logging
 from google.genai import Client as GenAIClient
 
 # Clients
 bq_client = bigquery.Client()
 fs_client = firestore.Client()
 publisher = pubsub_v1.PublisherClient()
+logging_client = gcp_logging.Client(project="solid-future-452906-a2")
 
 PROJECT_ID = "solid-future-452906-a2"
 DATASET = "gym_analytics"
 GEMINI_MODEL = "gemini-2.5-flash"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
+
+# Pipeline stages walked in Stage C, in order
+PIPELINE_STAGES = [
+    "webhook-dispatcher",
+    "acuity-enricher",
+    "acuity-translator",
+    "bigquery-listener",
+    "customerio-listener",
+]
 
 CLASSIFICATION_PROMPT = """
 Je bent een assistent die berichten van sportscholinstructeurs classificeert.
@@ -225,7 +236,8 @@ def slack_dm_dennis(token: str, dennis_user_id: str, text: str) -> dict:
 def send_dennis_investigation_report(
     token: str, dennis_user_id: str,
     task_doc_id: str, user_message: str,
-    events: list, diagnosis: dict, resolution_taken: str
+    events: list, diagnosis: dict, resolution_taken: str,
+    staged_findings: dict = None
 ):
     if events:
         lines = [f"  • {e.get('received_at', '?')} – {e.get('event_type', '?')}" for e in events[:5]]
@@ -233,7 +245,7 @@ def send_dennis_investigation_report(
         if len(events) > 5:
             events_summary += f"\n  … en {len(events) - 5} meer"
     else:
-        events_summary = "Geen events gevonden in BigQuery — onderzoek waarom er geen event is aangemaakt (webhook niet gefired? pipeline dropped? bronsysteem?)"
+        events_summary = "Geen BigQuery events bevraagd (staged investigation gebruikt)" if staged_findings else "Geen events gevonden in BigQuery — onderzoek waarom er geen event is aangemaakt (webhook niet gefired? pipeline dropped? bronsysteem?)"
 
     confidence = diagnosis.get("confidence", "?")
     root_cause_category = diagnosis.get("root_cause_category", "unknown")
@@ -248,6 +260,49 @@ def send_dennis_investigation_report(
         f"*Confidence:* {confidence}\n"
         f"*Actie:* {resolution_taken}"
     )
+
+    if staged_findings:
+        sa = staged_findings.get("stage_a") or {}
+        sb = staged_findings.get("stage_b")
+        sc = staged_findings.get("stage_c")
+
+        if sa.get("skipped"):
+            stage_a_line = "⏭️ overgeslagen (Acuity niet geconfigureerd)"
+        elif sa.get("found"):
+            appt = sa.get("appointment") or {}
+            stage_a_line = f"✅ afspraak gevonden — type: {appt.get('type', '?')}, datum: {appt.get('datetime', '?')}, aangemaakt: {appt.get('created_at', '?')}"
+        elif sa.get("error"):
+            stage_a_line = f"⚠️ fout bij bevragen: {sa['error']}"
+        else:
+            stage_a_line = "❌ geen actieve afspraak gevonden in Acuity"
+
+        if sb is None:
+            stage_b_line = "⏭️ niet uitgevoerd (Stage A niet conclusief)"
+        elif sb.get("mismatch_found"):
+            stage_b_line = f"❌ mismatch: {sb.get('mismatch_description', '')}"
+        elif sb.get("error"):
+            stage_b_line = f"⚠️ fout: {sb['error']}"
+        else:
+            stage_b_line = "✅ identiteit consistent"
+
+        if sc is None:
+            stage_c_line = "⏭️ niet uitgevoerd (Stage B conclusief)"
+        elif sc.get("error"):
+            stage_c_line = f"⚠️ fout bij log-query: {sc['error']}"
+        elif sc.get("first_missing_stage"):
+            stage_c_line = f"❌ drop bij `{sc['first_missing_stage']}` — {sc.get('evidence', '')}"
+        else:
+            stage_c_line = f"⚠️ aanwezig in alle stages — {sc.get('evidence', '')}"
+
+        report += (
+            f"\n\n*Staged investigation (Acuity appointment):*\n"
+            f"  Stage A (Acuity bron): {stage_a_line}\n"
+            f"  Stage B (Identity): {stage_b_line}\n"
+            f"  Stage C (Pipeline): {stage_c_line}"
+        )
+        if sc and sc.get("stages_checked"):
+            report += f"\n  Stages gecontroleerd: {', '.join(sc['stages_checked'])}"
+
     slack_dm_dennis(token=token, dennis_user_id=dennis_user_id, text=report)
     log({"TO_SLACK_DENNIS_REPORT": {"task_doc_id": task_doc_id, "confidence": confidence, "root_cause_category": root_cause_category}})
 
@@ -423,10 +478,8 @@ def call_gemini_json(system_prompt: str, user_message: str) -> dict:
 def _prefilter_irrelevant(message: str) -> bool:
     import re
     stripped = message.strip()
-    # Pure mention(s): "@naam" or "@naam @naam2" with no other content
     if re.fullmatch(r'(@\w+\s*)+', stripped):
         return True
-    # Very short message (≤2 words) that starts with @ — e.g. "@mark check"
     words = stripped.split()
     if words and words[0].startswith('@') and len(words) <= 2:
         return True
@@ -441,7 +494,6 @@ def classify_message(message: str, conversation: list = None) -> dict:
 
     user_content = message
     if conversation:
-        # Last 5 turns for context; role + content only — no structured PII
         history_lines = [f"{m['role']}: {m['content']}" for m in conversation[-5:]]
         user_content = f"Gespreksgeschiedenis:\n{chr(10).join(history_lines)}\n\nNieuw bericht: {message}"
     result = call_gemini_json(CLASSIFICATION_PROMPT, user_content)
@@ -678,7 +730,6 @@ def handle_awaiting_confirmation(
         log({"SESSION_RESOLVED_BY_EMPLOYEE": {"session_doc_id": session_doc_id}})
 
     elif negative:
-        # Employee says resolution was wrong — reopen
         update_session(session_doc_id, {
             "status": "investigating",
             "conversation": firestore.ArrayUnion([
@@ -700,6 +751,376 @@ def handle_awaiting_confirmation(
         )
         append_to_session_conversation(session_doc_id, "employee", user_message)
         log({"SESSION_CONFIRMATION_UNCLEAR": {"session_doc_id": session_doc_id}})
+
+
+# ── STAGED INVESTIGATION (appointment case) ───────────────────────────────────
+
+def _service_enabled(tenant: dict, service: str) -> bool:
+    """
+    Check if a service is enabled for this tenant.
+    Respects the enabledServices field if present; falls back to credential presence.
+    """
+    enabled = tenant.get("enabledServices")
+    if enabled is not None:
+        return service in enabled
+    if service == "acuity":
+        return bool(tenant.get("acuityConfig", {}).get("apiKey"))
+    if service == "sportivity":
+        return bool(tenant.get("sportivityToken"))
+    if service == "customerio":
+        return bool(tenant.get("customerio", {}).get("app_api_key"))
+    return False
+
+
+def investigate_stage_a_acuity(tenant: dict, email: str) -> dict:
+    if not _service_enabled(tenant, "acuity"):
+        log({"STAGE_A_SKIPPED": {"reason": "acuity not enabled"}})
+        return {"found": False, "appointment": None, "skipped": True, "error": None}
+
+    acuity_config = tenant.get("acuityConfig", {})
+    api_key = acuity_config.get("apiKey")
+    user_id = acuity_config.get("userId")
+
+    if not api_key or not user_id:
+        log({"STAGE_A_ERROR": {"reason": "missing acuity credentials"}})
+        return {"found": False, "appointment": None, "skipped": False, "error": "missing acuity credentials"}
+
+    try:
+        now_ams = datetime.now(AMSTERDAM_TZ)
+        min_date = (now_ams - timedelta(days=90)).strftime("%Y-%m-%d")
+        max_date = (now_ams + timedelta(days=180)).strftime("%Y-%m-%d")
+
+        resp = requests.get(
+            "https://acuityscheduling.com/api/v1/appointments",
+            auth=(user_id, api_key),
+            params={"email": email.lower(), "max": 20, "minDate": min_date, "maxDate": max_date},
+            headers={"Accept": "application/json"},
+            timeout=15
+        )
+        resp.raise_for_status()
+        appointments = resp.json()
+
+        active = [a for a in appointments if not a.get("canceled", False)]
+
+        log({"STAGE_A_QUERY": {
+            "email": email,
+            "total_returned": len(appointments),
+            "active_count": len(active),
+            "window": f"{min_date} – {max_date}"
+        }})
+
+        if not active:
+            return {"found": False, "appointment": None, "skipped": False, "error": None}
+
+        # Sort by datetime descending — most upcoming / most recent first
+        active.sort(key=lambda a: a.get("datetime", ""), reverse=True)
+        appt = active[0]
+
+        # Extract only non-PII scheduling metadata — no name, phone, notes
+        result = {
+            "id": appt.get("id"),
+            "type": appt.get("type"),
+            "datetime": appt.get("datetime"),
+            "created_at": appt.get("createdAt"),
+            "appointment_type_id": appt.get("appointmentTypeID"),
+        }
+        log({"STAGE_A_RESULT": {
+            "found": True,
+            "appointment_id": result["id"],
+            "appointment_type": result["type"],
+            "appointment_datetime": result["datetime"],
+            "created_at": result["created_at"]
+        }})
+        return {"found": True, "appointment": result, "skipped": False, "error": None}
+
+    except Exception as e:
+        log({"STAGE_A_ERROR": {"error": str(e)}})
+        return {"found": False, "appointment": None, "skipped": False, "error": str(e)}
+
+
+def investigate_stage_b_identity(tenant: dict, customer_id: str, task_email: str) -> dict:
+    """
+    Checks whether the customer_id in the task maps to the expected email
+    in Sportivity and Customer.io. A mismatch means the customer exists
+    under two identities, which would cause pipeline matching to fail.
+    PII rule: only the boolean mismatch result and a non-PII description are returned.
+    """
+    mismatches = []
+    task_email_lower = (task_email or "").lower()
+
+    # Sportivity — only possible with a customer_id; no customer_id means not in Sportivity
+    if customer_id and _service_enabled(tenant, "sportivity"):
+        sportivity_token = tenant.get("sportivityToken")
+        if sportivity_token:
+            try:
+                url = f"https://www.sportivity.info/sportivity-api/Customers/{customer_id}?Mem=true"
+                resp = requests.get(
+                    url,
+                    headers={"accept": "application/json", "X-API-TOKEN": sportivity_token},
+                    timeout=15
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    sportivity_email = (
+                        data.get("Email") or data.get("email") or ""
+                    ).lower()
+                    if sportivity_email and task_email_lower and sportivity_email != task_email_lower:
+                        mismatches.append("Sportivity email voor dit customer_id verschilt van het email in de taak")
+                    log({"STAGE_B_SPORTIVITY": {
+                        "customer_id": customer_id,
+                        "emails_match": sportivity_email == task_email_lower
+                    }})
+                elif resp.status_code == 404:
+                    log({"STAGE_B_SPORTIVITY": {"not_found": True, "customer_id": customer_id}})
+                else:
+                    log({"STAGE_B_SPORTIVITY_ERROR": {"status": resp.status_code}})
+            except Exception as e:
+                log({"STAGE_B_SPORTIVITY_ERROR": {"error": str(e)}})
+
+    # Customer.io App API
+    if _service_enabled(tenant, "customerio"):
+        cio_key = tenant.get("customerio", {}).get("app_api_key")
+        if cio_key and customer_id:
+            try:
+                resp = requests.get(
+                    f"https://api.customer.io/v1/customers/{customer_id}",
+                    headers={"Authorization": f"Bearer {cio_key}"},
+                    timeout=15
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # App API wraps the profile under "customer"
+                    customer = data.get("customer", data)
+                    cio_email = (customer.get("email") or "").lower()
+                    if cio_email and task_email_lower and cio_email != task_email_lower:
+                        mismatches.append("Customer.io email voor dit customer_id verschilt van het email in de taak")
+                    log({"STAGE_B_CUSTOMERIO": {
+                        "customer_id": customer_id,
+                        "emails_match": cio_email == task_email_lower
+                    }})
+                elif resp.status_code == 404:
+                    log({"STAGE_B_CUSTOMERIO": {"not_found": True, "customer_id": customer_id}})
+                else:
+                    log({"STAGE_B_CUSTOMERIO_ERROR": {"status": resp.status_code}})
+            except Exception as e:
+                log({"STAGE_B_CUSTOMERIO_ERROR": {"error": str(e)}})
+
+    mismatch_found = len(mismatches) > 0
+    description = "; ".join(mismatches) if mismatches else "identiteit consistent"
+    log({"STAGE_B_RESULT": {"mismatch_found": mismatch_found}})
+    return {
+        "identity_clean": not mismatch_found,
+        "mismatch_found": mismatch_found,
+        "mismatch_description": description,
+        "skipped": False,
+        "error": None
+    }
+
+
+def _search_stage_logs(stage_name: str, search_terms: list, start_time: datetime, end_time: datetime) -> tuple:
+    """
+    Returns (found: bool | None, entry_count: int).
+    None means the query itself failed — caller treats this as indeterminate.
+    """
+    terms = [t for t in search_terms if t]
+    filter_parts = [
+        'resource.type="cloud_run_revision"',
+        f'resource.labels.service_name="{stage_name}"',
+        f'timestamp>="{start_time.isoformat()}"',
+        f'timestamp<="{end_time.isoformat()}"',
+    ]
+    if terms:
+        # OR-join search terms so either customer_id or email triggers a hit
+        terms_clause = " OR ".join(f'"{t}"' for t in terms)
+        filter_parts.append(f"({terms_clause})")
+
+    filter_str = "\n".join(filter_parts)
+    try:
+        entries = list(logging_client.list_entries(filter_=filter_str, page_size=5))
+        return len(entries) > 0, len(entries)
+    except Exception as e:
+        log({"STAGE_C_LOG_QUERY_ERROR": {"stage": stage_name, "error": str(e)}})
+        return None, 0
+
+
+def investigate_stage_c_pipeline(customer_id: str, email: str, anchor_time: datetime) -> dict:
+    window_start = anchor_time - timedelta(minutes=5)
+    window_end = anchor_time + timedelta(hours=2)
+
+    search_terms = []
+    if customer_id:
+        search_terms.append(str(customer_id))
+    if email:
+        search_terms.append(email.lower())
+
+    stages_checked = []
+    first_missing = None
+    query_errors = []
+
+    for stage in PIPELINE_STAGES:
+        found, count = _search_stage_logs(stage, search_terms, window_start, window_end)
+        log({"STAGE_C_STAGE_RESULT": {"stage": stage, "found": found, "entry_count": count}})
+
+        if found is None:
+            # Log query failed for this stage — record but don't treat as a drop
+            query_errors.append(stage)
+            continue
+
+        stages_checked.append(stage)
+        if not found:
+            first_missing = stage
+            break
+
+    if first_missing:
+        preceding = [s for s in stages_checked if s != first_missing]
+        evidence = (
+            f"Event aanwezig in: {', '.join(preceding) if preceding else 'geen'}. "
+            f"Absent bij: {first_missing}. "
+            f"Tijdvenster: {window_start.isoformat()} – {window_end.isoformat()}."
+        )
+    elif query_errors:
+        evidence = f"Log-queries mislukten voor: {', '.join(query_errors)}. Stages gecontroleerd: {', '.join(stages_checked)}."
+    elif len(stages_checked) == len(PIPELINE_STAGES):
+        evidence = (
+            f"Event aanwezig in alle {len(PIPELINE_STAGES)} pipeline-stages. "
+            f"Anomalie: taak is toch niet voltooid — handmatig onderzoek vereist."
+        )
+    else:
+        evidence = f"Gecontroleerde stages: {', '.join(stages_checked)}. Geen drop-punt gevonden."
+
+    log({"STAGE_C_RESULT": {
+        "first_missing_stage": first_missing,
+        "stages_checked": stages_checked,
+        "query_errors": query_errors
+    }})
+    return {
+        "first_missing_stage": first_missing,
+        "stages_checked": stages_checked,
+        "query_errors": query_errors,
+        "evidence": evidence,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "error": "; ".join(query_errors) if query_errors and not stages_checked else None
+    }
+
+
+def investigate_discrepancy_appointment(
+    tenant_id: str, tenant: dict, task_data: dict, employee_message: str
+) -> dict:
+    """
+    Three-stage source-truth-first investigation for action_type == 'appointment'.
+    Always returns resolution_possible: False and needs_dennis_approval: True (Stage 1).
+    Staged findings are included for the Dennis report and error_log.
+    PII rule: no raw API profiles are persisted or passed to Gemini.
+    """
+    email = (task_data.get("email") or "").lower()
+    customer_id = task_data.get("customer_id")
+
+    log({"APPOINTMENT_INVESTIGATION_START": {
+        "task_type": task_data.get("task_type"),
+        "customer_id": customer_id,
+        "email": email
+    }})
+
+    # ── Stage A: Acuity source truth ──────────────────────────────────────────
+    stage_a = investigate_stage_a_acuity(tenant, email)
+
+    if not stage_a.get("found"):
+        if stage_a.get("skipped"):
+            employee_msg = "We kunnen het bronsysteem niet bereiken om dit te controleren — Dennis bekijkt het."
+            category = "unknown"
+            confidence = "low"
+            root_cause = "Acuity niet geconfigureerd voor deze tenant — Stage A overgeslagen"
+        elif stage_a.get("error"):
+            employee_msg = "Er is een technisch probleem bij het controleren van de afspraak — Dennis bekijkt het."
+            category = "unknown"
+            confidence = "low"
+            root_cause = f"Stage A mislukt door technische fout: {stage_a['error']}"
+        else:
+            employee_msg = "De afspraak staat niet in het systeem onder dit e-mailadres. Mogelijk is die ingepland onder een ander e-mailadres of staat er toch geen afspraak."
+            category = "appointment_not_in_source"
+            confidence = "high"
+            root_cause = f"Geen actieve afspraak gevonden in Acuity voor e-mailadres {email} in het venster −90/+180 dagen"
+
+        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "A", "category": category}})
+        return {
+            "root_cause_category": category,
+            "root_cause": root_cause,
+            "confidence": confidence,
+            "evidence": f"Acuity bevraagd voor {email}; {stage_a.get('error') or 'geen actieve afspraken gevonden'}",
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": "Controleer bij de medewerker of de afspraak onder een ander e-mailadres staat, of dat er inderdaad geen afspraak is",
+            "employee_message": employee_msg,
+            "staged_findings": {"stage_a": stage_a, "stage_b": None, "stage_c": None}
+        }
+
+    appt = stage_a["appointment"]
+
+    # ── Stage B: Identity reconciliation ─────────────────────────────────────
+    stage_b = investigate_stage_b_identity(tenant, str(customer_id) if customer_id else None, email)
+
+    if stage_b.get("mismatch_found"):
+        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "B", "category": "identity_mismatch"}})
+        return {
+            "root_cause_category": "identity_mismatch",
+            "root_cause": f"Identiteitsmismatch: {stage_b['mismatch_description']}",
+            "confidence": "high",
+            "evidence": stage_b["mismatch_description"],
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": "Account-merge vereist in Sportivity en/of Customer.io — Dennis beslist over de aanpak",
+            "employee_message": "Er lijkt een dubbel account te zijn voor dit lid. Dennis lost dit op.",
+            "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": None}
+        }
+
+    # ── Stage C: Pipeline log walk ────────────────────────────────────────────
+    created_at_str = appt.get("created_at")
+    try:
+        anchor_time = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
+        if anchor_time.tzinfo is None:
+            anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+    except Exception:
+        anchor_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        log({"STAGE_C_ANCHOR_FALLBACK": {"created_at_str": created_at_str}})
+
+    stage_c = investigate_stage_c_pipeline(
+        str(customer_id) if customer_id else None, email, anchor_time
+    )
+
+    if stage_c.get("first_missing_stage"):
+        drop_stage = stage_c["first_missing_stage"]
+        category = f"pipeline_drop_{drop_stage.replace('-', '_')}"
+        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": category}})
+        return {
+            "root_cause_category": category,
+            "root_cause": f"Event weggevallen bij pipeline-stage '{drop_stage}'",
+            "confidence": "medium",
+            "evidence": stage_c["evidence"],
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": f"Pipeline drop bij '{drop_stage}' — Dennis onderzoekt de oorzaak en bepaalt replay-strategie",
+            "employee_message": "De afspraak staat ingepland, maar is ergens in de koppeling vastgelopen. Dennis pakt dit op.",
+            "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+        }
+
+    # All stages present — event flowed through the full pipeline but task didn't close
+    log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": "unknown", "reason": "all stages present"}})
+    return {
+        "root_cause_category": "unknown",
+        "root_cause": "Afspraak aanwezig in Acuity, identiteit consistent, event aanwezig in alle pipeline-stages — anomalie",
+        "confidence": "low",
+        "evidence": stage_c["evidence"],
+        "needs_dennis_approval": True,
+        "resolution_possible": False,
+        "resolution_method": "escalate",
+        "resolution_description": "Handmatig onderzoek door Dennis — alle systemen tonen de afspraak maar de taak is niet gesloten",
+        "employee_message": "We zien de afspraak staan, maar kunnen de verwerking niet volledig traceren. Dennis bekijkt het.",
+        "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+    }
 
 
 # ── TASK INVESTIGATION HANDLER ────────────────────────────────────────────────
@@ -742,13 +1163,11 @@ def handle_task_investigation(
             return
 
         if status == "awaiting_dennis_approval":
-            # Log the message but don't re-investigate — waiting for Dennis
             append_to_session_conversation(session_doc_id, "employee", user_message)
             log({"SESSION_DENNIS_PENDING_MESSAGE_LOGGED": {"session_doc_id": session_doc_id}})
             return
 
         if status == "resolved":
-            # If the task is still open, a new signal is meaningful — fall through to re-classify
             task_doc_id_check = session.get("task_doc_id")
             task_is_open = False
             if task_doc_id_check:
@@ -907,6 +1326,7 @@ def handle_task_investigation(
     customer_id = task_data.get("customer_id")
     email = task_data.get("email")
     created_at = task_data.get("created_at")
+    action_type = task_data.get("action_type")
 
     if hasattr(created_at, "isoformat"):
         created_at_dt = created_at.replace(tzinfo=timezone.utc) if created_at.tzinfo is None else created_at
@@ -914,10 +1334,24 @@ def handle_task_investigation(
         created_at_dt = datetime.now(timezone.utc) - timedelta(hours=24)
 
     investigation_steps = ["firestore"]
-    events = get_events_for_task(tenant_id, str(customer_id) if customer_id else None, email, created_at_dt)
-    investigation_steps.append("bigquery")
 
-    diagnosis = investigate_discrepancy(task_data, events, user_message)
+    if action_type == "appointment":
+        # Staged source-truth-first investigation — no BigQuery query
+        investigation_steps.append("acuity_stage_a")
+        diagnosis = investigate_discrepancy_appointment(tenant_id, tenant, task_data, user_message)
+        events = []
+        staged_findings = diagnosis.get("staged_findings")
+        sf = staged_findings or {}
+        if sf.get("stage_b") is not None:
+            investigation_steps.append("identity_stage_b")
+        if sf.get("stage_c") is not None:
+            investigation_steps.append("pipeline_stage_c")
+    else:
+        # Non-appointment: existing BigQuery + Gemini path
+        events = get_events_for_task(tenant_id, str(customer_id) if customer_id else None, email, created_at_dt)
+        investigation_steps.append("bigquery")
+        diagnosis = investigate_discrepancy(task_data, events, user_message)
+        staged_findings = None
 
     root_cause = diagnosis.get("root_cause", "")
     root_cause_category = diagnosis.get("root_cause_category", "unknown")
@@ -946,6 +1380,9 @@ def handle_task_investigation(
     resolution = None
     approved_by = None
 
+    # For action_type == "appointment" in Stage 1, the diagnosis contract guarantees
+    # resolution_possible: False and needs_dennis_approval: True, so can_auto_resolve
+    # is always False for that path without needing an explicit gate here.
     can_auto_resolve = (
         resolution_possible
         and not needs_dennis
@@ -954,7 +1391,6 @@ def handle_task_investigation(
     )
 
     if can_auto_resolve:
-        # Fix identified with high confidence — apply autonomously, then inform Dennis.
         if resolution_method == "pipeline_event":
             publish_correction_event(tenant_id, task_data, task_doc_id)
             resolution = "Correctie-event gepubliceerd via pipeline + taak voltooid"
@@ -984,11 +1420,11 @@ def handle_task_investigation(
             token=slack_token, dennis_user_id=dennis_user_id,
             task_doc_id=task_doc_id, user_message=user_message,
             events=events, diagnosis=diagnosis,
-            resolution_taken=f"✅ Autonoom opgelost — {resolution}"
+            resolution_taken=f"✅ Autonoom opgelost — {resolution}",
+            staged_findings=staged_findings
         )
 
     elif resolution_possible:
-        # Fix identified but requires Dennis approval before applying.
         fix_proposal = diagnosis.get("resolution_description") or diagnosis.get("escalation_summary") or root_cause
         resolution = f"Voorstel ter goedkeuring: {fix_proposal}"
         approved_by = "dennis"
@@ -1003,11 +1439,11 @@ def handle_task_investigation(
             token=slack_token, dennis_user_id=dennis_user_id,
             task_doc_id=task_doc_id, user_message=user_message,
             events=events, diagnosis=diagnosis,
-            resolution_taken=f"⚠️ Goedkeuring gevraagd — {fix_proposal}"
+            resolution_taken=f"⚠️ Goedkeuring gevraagd — {fix_proposal}",
+            staged_findings=staged_findings
         )
 
     else:
-        # No fix possible — investigation complete, inform Dennis of the situation.
         resolution = f"Geen fix mogelijk: {root_cause or 'oorzaak onbekend'}"
         approved_by = None
         log({"TO_DENNIS_INFORMED": {"task_doc_id": task_doc_id}})
@@ -1021,7 +1457,8 @@ def handle_task_investigation(
             token=slack_token, dennis_user_id=dennis_user_id,
             task_doc_id=task_doc_id, user_message=user_message,
             events=events, diagnosis=diagnosis,
-            resolution_taken=f"ℹ️ Onderzoek afgerond — geen automatische fix mogelijk: {root_cause or 'oorzaak onbekend'}"
+            resolution_taken=f"ℹ️ Onderzoek afgerond — geen automatische fix mogelijk: {root_cause or 'oorzaak onbekend'}",
+            staged_findings=staged_findings
         )
 
     write_error_log(error_log_doc_id, {
@@ -1036,6 +1473,7 @@ def handle_task_investigation(
         "resolution_method": resolution_method,
         "approved_by": approved_by,
         "employee_confirmed": False,
+        "staged_findings": staged_findings,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "resolved_at": datetime.now(timezone.utc).isoformat() if approved_by == "agent" else None
     })
