@@ -1,3 +1,5 @@
+> Modus: Reference + Explanation — systeemstructuur, schemas en standaarden (Reference); ontwerprationale via ADRs (Explanation). Primaire laadcontext voor agents.
+
 # Habits — Architecture
 
 ## Overzicht
@@ -223,44 +225,60 @@ action_type      — bepaalt completion-logica: 'contact', 'appointment', 'subsc
 
 ---
 
+## Kwaliteitseisen
+
+| Kwaliteitsdoel | Omschrijving | Criterium |
+|---|---|---|
+| Tenant-isolatie | Geen gedeelde state tussen tenants | Alle Firestore-documenten, BigQuery-rijen en Pub/Sub-berichten zijn gekeyed op `tenant_id`; geen cross-tenant queries |
+| Service-verantwoordelijkheid | Elke service heeft één verantwoordelijkheid | Enrichment ≠ translation ≠ listening — nooit gecombineerd in één service |
+| PII-grens | Persoonsgegevens verlaten de Slack-context niet | PII staat nooit in Firestore-history, BigQuery `raw_events` als geïdentificeerd profiel, of Gemini-context |
+| LLM-datahygiëne | LLM ontvangt nooit ruwe ledendata | Gemini-input bevat uitsluitend geaggregeerde samenvattingen of niet-identificerende beslissingsresultaten (booleans, categorieën) |
+| Deployment-uniformiteit | Runtime is voorspelbaar en consistent | Alle services: Gen2 Cloud Functions, Python 3.12, `europe-west1` — geen Gen1, geen Cloud Run tenzij expliciet noodzakelijk |
+| Configureerbaar zonder deployment | Operationele parameters aanpasbaar zonder codewijziging | Prompts, taakconfigs en tenant-instellingen leven in Firestore |
+| Herleidbaarheid | Elke agent-actie is traceerbaar | Alle discrepantie-acties gelogd in `error_log` en `agent_sessions`; elke service logt INPUT en outputs als gestructureerde JSON |
+
+---
+
+## Risico's & technische schuld
+
+| Risico / Schuld | Omschrijving | Status |
+|---|---|---|
+| Pipeline log-walking zonder trace-ID | Stage C (staged investigation) doorzoekt Cloud Logging per service op `customer_id`/email. Werkt voor incidenteel gebruik; schaalt niet bij hoog volume. Structurele fix: trace-ID-propagatie door de pipeline. | Technische schuld — geen backlog-item |
+| Sportivity herprobeert webhooks niet | Bij pipeline-downtime gaat een Sportivity-webhook permanent verloren. DLQ helpt alleen voor berichten die al in Pub/Sub zitten. | Zie BACKLOG.md: *Sportivity reconciliatie-job* |
+| Proliferatie van agent-services | `habits-coach-reply` en `slack-agent` volgen hetzelfde basispatroon in aparte services. Zonder ingreep groeit het aantal agent-services lineair met het aantal processen. | Zie BACKLOG.md: *Eén configureerbare slack-agent* |
+| Identiteitsassumpties in de pipeline | De pipeline keyt op `customer_id` of `email`. Bij een klant met meerdere e-mailadressen valt completion-matching stil. Stage 1 detecteert dit; geautomatiseerd herstel ontbreekt nog. | Zie BACKLOG.md: *Integratieagent* |
+
+---
+
 ## Beslissingen
 
-**Event-driven boven request-driven**
-Alle communicatie tussen services verloopt via Pub/Sub topics, niet via directe HTTP-aanroepen tussen services.
+Alle architectuurbeslissingen zijn gedocumenteerd als ADRs. Raadpleeg de [ADR-index](docs/adr/README.md) voor een overzicht.
 
-*Waarom*: event-driven architectuur maakt services onafhankelijk van elkaar. Een service die faalt blokkeert geen andere services. Nieuwe consumers kunnen worden toegevoegd zonder bestaande services aan te passen.
+- Zie [ADR-0010](docs/adr/0010-event-driven-boven-request-driven.md) — Event-driven boven request-driven
+- Zie [ADR-0011](docs/adr/0011-scheiding-enrichment-translation-listening.md) — Scheiding van enrichment, translation en listening
+- Zie [ADR-0012](docs/adr/0012-llm-krijgt-nooit-ruwe-ledendata.md) — LLM krijgt nooit ruwe ledendata
+- Zie [ADR-0013](docs/adr/0013-pii-blijft-in-slack.md) — PII blijft in Slack
+- Zie [ADR-0014](docs/adr/0014-operationele-configuratie-in-firestore.md) — Operationele configuratie leeft in Firestore, niet in code
+- Zie [ADR-0015](docs/adr/0015-gen2-cloud-functions-standaard-runtime.md) — Gen2 Cloud Functions als standaard runtime
+- Zie [ADR-0016](docs/adr/0016-action-type-op-root-niveau.md) — action_type op root-niveau van CRM task payload
+- Zie [ADR-0017](docs/adr/0017-gemini-google-genai-sdk.md) — Gemini via google-genai SDK, niet Vertex AI
 
-**Scheiding van enrichment, translation en listening**
-Elke service heeft één verantwoordelijkheid. Enrichment haalt externe data op. Translation transformeert naar generiek formaat. Listening stuurt data naar ontvangende partijen. Deze verantwoordelijkheden worden nooit gecombineerd in één service.
+---
 
-*Waarom*: een service met meerdere verantwoordelijkheden is moeilijker te testen, te debuggen en te vervangen. Strikte scheiding maakt het systeem voorspelbaar en vervangbaar per onderdeel.
+## Glossary
 
-**LLM krijgt nooit ruwe ledendata**
-BigQuery handelt alle analyse af via deterministische SQL. Gemini ontvangt alleen geaggregeerde samenvattingen — nooit individuele ledenprofielen of persoonsgegevens.
-
-*Waarom*: PII mag het systeem niet verlaten via LLM-aanroepen. Bovendien levert deterministische SQL betere en controleerbare analyse dan LLM-redenering over ruwe data.
-
-**PII blijft in Slack**
-Persoonsgegevens worden getoond in Slack maar nooit opgeslagen in Firestore-geschiedenis of meegegeven aan Gemini als context.
-
-*Waarom*: Slack is het operationele kanaal waar medewerkers werken. Firestore en LLM-context zijn systeemdelen buiten die grens — daar hoort PII niet.
-
-**Operationele configuratie leeft in Firestore, niet in code**
-Prompts, task configs en tenant-specifieke instellingen worden beheerd via Firestore. Aanpassingen hieraan vereisen geen deployment.
-
-*Waarom*: kennis en uitvoering zijn gescheiden. Als configuratie in code zit, vereist elke aanpassing een deployment en een ontwikkelaar. In Firestore kan het systeem zichzelf aanpassen zonder codewijziging.
-
-**Gen2 Cloud Functions als standaard runtime**
-Alle services draaien als Cloud Functions Gen2 met Python 3.12. Geen Gen1, geen Cloud Run tenzij een specifieke beperking van Functions dat vereist.
-
-*Waarom*: consistentie in runtime verlaagt de operationele complexiteit. Gen2 met het `@functions_framework.cloud_event` patroon is de standaard voor alle Pub/Sub-functies.
-
-**action_type op root-niveau van CRM task payload**
-`action_type` bepaalt welk completion-event een taak afsluit en staat altijd op root-niveau van de payload, niet genest onder `payload.payload`. Backward compatibility via `effective_action_type` fallback in de `task_performance` view.
-
-*Waarom*: completion-logica moet onafhankelijk zijn van taaktype-namen die over tijd kunnen wijzigen. Door `action_type` expliciet mee te sturen vanuit Customer.io blijft de BigQuery view stabiel bij nieuwe taaktypen.
-
-**Gemini via google-genai SDK, niet Vertex AI**
-Alle Gemini-aanroepen gebruiken de `google-genai` SDK met een `GEMINI_API_KEY`. Vertex AI is niet bruikbaar in `europe-west1` voor Gemini modellen.
-
-*Waarom*: `europe-west1` heeft geen beschikbare publisher models via Vertex AI. De `google-genai` SDK met API key werkt wel en is consistent met hoe `habits-coach-reply` al opereerde.
+| Term | Definitie |
+|---|---|
+| **HHI (Habit Health Index)** | Centraal meetsysteem voor retentiegezondheid per lid en per locatie. Drie journeys: Onboarding, Member Maintenance, Reactivation. Drie dimensies: Retentiescore, Customer Success Score, Progressiescore. |
+| **Journey** | Een van de drie retentiefasen: Onboarding (nieuwe leden, eerste 90 dagen), Member Maintenance (actieve leden), Reactivation (leden die gestopt zijn met bezoeken). |
+| **Tenant** | Een locatie of keten met volledig geïsoleerde data, configuratie en doelen. Primaire testomgeving: Basecamp Fitness (`bZxqF49CzTXpBz1px3K0`). |
+| **Enrichment** | Een service die een inkomend event verrijkt met externe API-data en publiceert naar een `{source}-translations` topic. |
+| **Translation** | Een service die een verrijkt event omzet naar het generieke event-formaat en publiceert naar het `events` topic. |
+| **Listening** | Een service die events van het `events` topic ontvangt en doorstuurt naar een externe partij (Slack, Customer.io, BigQuery). |
+| **action_type** | Veld op root-niveau van een CRM-taakpayload. Bepaalt welk event-type de taak afsluit: `contact`, `appointment`, `subscription`, `review`. |
+| **effective_action_type** | Afgeleid veld in de `task_performance` BigQuery view. Backward-compatible fallback als `action_type` ontbreekt — afgeleid uit `task_type` via een vaste mapping. |
+| **doc_id** | Samengestelde Firestore-sleutel voor CRM-taken in `slack_messages`: `{tenant_id}_{channel_id}_{customer_id_of_hash_email}_{task_date}`. `task_date` altijd in Amsterdam-tijdzone. |
+| **visible** | Boolean op een CRM-taak. `false` = taak opgeslagen in Firestore en BigQuery maar geen Slack-output. |
+| **FitCheck** | Periodieke conditiemeting/check-in afspraak bij de sportschool. Matching via `LIKE '%fitcheck%'` in BigQuery views vanwege naamvarianten over tijd. |
+| **Reboot** | Reactivatie-afspraak voor leden die lang niet geweest zijn. |
+| **enabledServices** | Optioneel veld in `tenants/{tenant_id}`. Lijst van actieve externe systemen voor deze tenant (`acuity`, `sportivity`, `customerio`). Als het veld ontbreekt, valt de agent terug op credential-aanwezigheid. |

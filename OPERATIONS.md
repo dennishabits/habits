@@ -1,3 +1,5 @@
+> Modus: Reference — operationele configuratie voor agents en ontwikkelaars: payload-formaten, Firestore-config, prompt-richtlijnen.
+
 # Habits — Operations
 
 ## Gebruik

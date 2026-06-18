@@ -1,3 +1,5 @@
+> Modus: How-to + Reference — werkwijze en beslissingsbevoegdheid (How-to); schemas en standaarden (Reference). Secties zijn gelabeld.
+
 # Habits — Agent Policy
 
 ## Doel
@@ -9,6 +11,8 @@ Lees altijd ook `ARCHITECTURE.md` en `BUSINESS.md` voordat je begint. Raadpleeg 
 ---
 
 ## Kennisarchitectuur
+
+*[Reference]*
 
 | Document | Type | Functie |
 |---|---|---|
@@ -23,11 +27,15 @@ Lees altijd ook `ARCHITECTURE.md` en `BUSINESS.md` voordat je begint. Raadpleeg 
 
 ## Fase: Human-in-the-loop
 
+*[Reference]*
+
 Habits bevindt zich in de eerste agent-fase. Agents bouwen en analyseren zelfstandig, maar deployment vereist expliciete goedkeuring van Dennis voordat het wordt uitgevoerd.
 
 ---
 
 ## Beslissingsbevoegdheid
+
+*[Reference]*
 
 ### Zelfstandig uitvoeren
 
@@ -73,6 +81,8 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 
 ### Bij een debug-taak
 
+*[How-to]*
+
 1. Lees `ARCHITECTURE.md` — begrijp de service en zijn verantwoordelijkheid
 2. Lees de `main.py` van de betreffende service
 3. Lees de relevante logs (via `gcloud functions logs read`)
@@ -83,6 +93,8 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 
 ### Bij een nieuwe feature
 
+*[How-to]*
+
 1. Raadpleeg `BACKLOG.md` — staat het er al in?
 2. Raadpleeg `ARCHITECTURE.md` — past het in de bestaande pipeline?
 3. Bespreek het ontwerp eerst — schrijf geen code zonder alignment op de aanpak
@@ -92,11 +104,15 @@ Bij twijfel: escaleer. Een verkeerde deployment is omkeerbaar. Een verkeerde inf
 
 ### Bij een onduidelijke taak
 
+*[How-to]*
+
 Stel één gerichte vraag. Niet meerdere vragen tegelijk. Niet gokken en hopen.
 
 ---
 
 ## Foutafhandeling via slack-agent
+
+*[Reference]*
 
 De `slack-agent` handelt discrepanties in taakverwerking af via de Slack-thread van de betreffende taak. Dit proces volgt vaste regels.
 
@@ -183,6 +199,8 @@ Ontbreekt: [waarom de oorzaak nog onduidelijk is]
 
 ## Firestore foutlog
 
+*[Reference]*
+
 Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en auditing.
 
 ### Schema
@@ -211,6 +229,8 @@ De foutlog is de primaire bron voor patroonherkenning. Periodiek worden terugker
 ---
 
 ## Firestore sessiestate
+
+*[Reference]*
 
 De `slack-agent` slaat per thread een sessie op in `agent_sessions/{tenant_id}_{thread_ts}`.
 
@@ -243,6 +263,8 @@ Schrijven naar `agent_sessions` is autonome actie — geen goedkeuring vereist.
 ---
 
 ## Technische standaarden
+
+*[Reference]*
 
 Alle standaarden staan in `ARCHITECTURE.md` onder "Ontwikkelprincipes". Samenvatting van de meest kritieke:
 
@@ -318,6 +340,8 @@ gcloud functions logs read [naam] \
 
 ## Wat een agent nooit doet
 
+*[Reference]*
+
 - Code verwijderen zonder eerst te beschrijven wat het doet en om bevestiging te vragen
 - Aannames maken over welk model, topic of kanaal gebruikt wordt — altijd verifiëren in `ARCHITECTURE.md`
 - Partial code delen — altijd complete, deploybare bestanden
@@ -330,6 +354,8 @@ gcloud functions logs read [naam] \
 ---
 
 ## Escalatiepad
+
+*[How-to]*
 
 Bij twijfel over beslissingsbevoegdheid: niet uitvoeren, maar presenteren aan Dennis met een korte toelichting waarom dit buiten de zelfstandige bevoegdheid valt.
 

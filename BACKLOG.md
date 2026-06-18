@@ -1,3 +1,5 @@
+> Modus: Reference — toekomstig werk. Agents raadplegen dit vóór het ontwerpen van nieuwe features.
+
 # Habits — Backlog
 
 ## Gebruik
