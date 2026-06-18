@@ -286,8 +286,12 @@ def acuity_enricher(cloud_event):
                     envelope_customer_id = customer_data.get("customer_id")
                     envelope_email = customer_data.get("email")
             else:
-                customer_data = None
-                lookup_method = "no_contact_info"
+                log_json("APPOINTMENT_REJECTED_NO_IDENTIFIER", {
+                    "appointment_id": appointment_id,
+                    "appointment_type": appointment_data.get("type"),
+                    "reason": "geen email of telefoonnummer — afspraak niet verwerkt"
+                })
+                return
 
             log_json("ENRICHMENT_BIGQUERY_LOOKUP", {
                 "lookup_method": lookup_method,

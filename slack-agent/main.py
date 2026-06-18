@@ -855,7 +855,7 @@ def investigate_stage_a_acuity(tenant: dict, email: str) -> dict:
             "id": appt.get("id"),
             "type": appt.get("type"),
             "datetime": appt.get("datetime"),
-            "created_at": appt.get("createdAt"),
+            "created_at": appt.get("datetimeCreated"),
             "appointment_type_id": appt.get("appointmentTypeID"),
         }
         log({"STAGE_A_RESULT": {
