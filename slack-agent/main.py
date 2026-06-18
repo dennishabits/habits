@@ -977,65 +977,147 @@ def _search_stage_logs(stage_name: str, search_terms: list, start_time: datetime
         return None, 0
 
 
-def investigate_stage_c_pipeline(customer_id: str, email: str, anchor_time: datetime) -> dict:
-    window_start = anchor_time - timedelta(minutes=5)
-    window_end = anchor_time + timedelta(hours=2)
+def investigate_stage_c_bigquery(tenant_id: str, customer_id: str, email: str) -> dict:
+    """
+    Checks BigQuery raw_events and appointments view for this customer.
+    Identifies why an appointment-based task wasn't completed.
+    """
+    try:
+        email_lower = email.lower().strip() if email else ""
+        now = datetime.now(timezone.utc)
 
-    search_terms = []
-    if customer_id:
-        search_terms.append(str(customer_id))
-    if email:
-        search_terms.append(email.lower())
+        params = [
+            bigquery.ScalarQueryParameter("tenant_id", "STRING", tenant_id),
+            bigquery.ScalarQueryParameter("email", "STRING", email_lower),
+            bigquery.ScalarQueryParameter("customer_id", "STRING", str(customer_id) if customer_id else None),
+        ]
 
-    stages_checked = []
-    first_missing = None
-    query_errors = []
+        raw_rows = list(bq_client.query("""
+            SELECT
+              event_type,
+              JSON_VALUE(raw_payload, '$.status')           AS status,
+              JSON_VALUE(raw_payload, '$.activity')         AS activity,
+              JSON_VALUE(raw_payload, '$.type')             AS appt_type,
+              JSON_VALUE(raw_payload, '$.confirmation_page') AS confirmation_page,
+              TIMESTAMP(JSON_VALUE(raw_payload, '$.start_at')) AS start_at,
+              received_at
+            FROM `solid-future-452906-a2.gym_analytics.raw_events`
+            WHERE webhook_source = 'acuity'
+              AND tenant_id = @tenant_id
+              AND (LOWER(email) = @email
+                   OR (@customer_id IS NOT NULL AND customer_id = @customer_id))
+            ORDER BY received_at DESC
+            LIMIT 30
+        """, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
 
-    for stage in PIPELINE_STAGES:
-        found, count = _search_stage_logs(stage, search_terms, window_start, window_end)
-        log({"STAGE_C_STAGE_RESULT": {"stage": stage, "found": found, "entry_count": count}})
+        view_rows = list(bq_client.query("""
+            SELECT
+              appointment_type,
+              activity,
+              start_at,
+              confirmation_page,
+              followup_scheduled,
+              is_known_customer
+            FROM `solid-future-452906-a2.gym_analytics.appointments`
+            WHERE tenant_id = @tenant_id
+              AND (LOWER(email) = @email
+                   OR (@customer_id IS NOT NULL AND customer_id = @customer_id))
+            ORDER BY start_at DESC
+            LIMIT 20
+        """, job_config=bigquery.QueryJobConfig(query_parameters=params)).result())
 
-        if found is None:
-            # Log query failed for this stage — record but don't treat as a drop
-            query_errors.append(stage)
-            continue
+        log({"STAGE_C_BIGQUERY": {
+            "raw_events_count": len(raw_rows),
+            "view_count": len(view_rows)
+        }})
 
-        stages_checked.append(stage)
-        if not found:
-            first_missing = stage
-            break
+        booked = [r for r in raw_rows if r.event_type == 'appointment' and r.status == 'new']
+        cancelled_pages = {r.confirmation_page for r in raw_rows
+                           if r.event_type == 'appointment' and r.status == 'cancelled'}
+        active = [r for r in booked if r.confirmation_page not in cancelled_pages]
+        future = [r for r in active if r.start_at and r.start_at > now]
+        past   = [r for r in active if r.start_at and r.start_at <= now]
 
-    if first_missing:
-        preceding = [s for s in stages_checked if s != first_missing]
-        evidence = (
-            f"Event aanwezig in: {', '.join(preceding) if preceding else 'geen'}. "
-            f"Absent bij: {first_missing}. "
-            f"Tijdvenster: {window_start.isoformat()} – {window_end.isoformat()}."
-        )
-    elif query_errors:
-        evidence = f"Log-queries mislukten voor: {', '.join(query_errors)}. Stages gecontroleerd: {', '.join(stages_checked)}."
-    elif len(stages_checked) == len(PIPELINE_STAGES):
-        evidence = (
-            f"Event aanwezig in alle {len(PIPELINE_STAGES)} pipeline-stages. "
-            f"Anomalie: taak is toch niet voltooid — handmatig onderzoek vereist."
-        )
-    else:
-        evidence = f"Gecontroleerde stages: {', '.join(stages_checked)}. Geen drop-punt gevonden."
+        if not raw_rows:
+            category = "not_in_raw_events"
+            evidence = f"Geen Acuity-events gevonden in BigQuery raw_events voor {email_lower}. Webhook is nooit verwerkt door de pipeline."
 
-    log({"STAGE_C_RESULT": {
-        "first_missing_stage": first_missing,
-        "stages_checked": stages_checked,
-        "query_errors": query_errors
-    }})
-    return {
-        "first_missing_stage": first_missing,
-        "stages_checked": stages_checked,
-        "query_errors": query_errors,
-        "evidence": evidence,
-        "window_start": window_start.isoformat(),
-        "window_end": window_end.isoformat(),
-        "error": "; ".join(query_errors) if query_errors and not stages_checked else None
-    }
+        elif not active:
+            category = "appointment_cancelled"
+            evidence = f"{len(raw_rows)} event(s) in raw_events, maar alle afspraken zijn geannuleerd."
+
+        elif future and not past and not view_rows:
+            appt = future[0]
+            category = "appointment_future_not_in_view"
+            evidence = (
+                f"Afspraak gevonden in raw_events: {appt.appt_type} op {str(appt.start_at)[:10]}. "
+                f"Staat in de toekomst — appointments view filtert deze eruit (start_at < nu). "
+                f"De taakafsluitingslogica mag niet afhangen van de view voor toekomstige afspraken."
+            )
+
+        elif view_rows:
+            followup_true  = [r for r in view_rows if r.followup_scheduled is True]
+            followup_false = [r for r in view_rows if r.followup_scheduled is False]
+
+            if followup_true:
+                appt = followup_true[0]
+                category = "followup_scheduled_task_not_closed"
+                evidence = (
+                    f"Afspraak zichtbaar in appointments view ({appt.appointment_type}, {str(appt.start_at)[:10]}) "
+                    f"én followup_scheduled = true. Vervolgafspraak is al ingepland. "
+                    f"Anomalie: taak had al gesloten moeten zijn."
+                )
+            elif followup_false:
+                appt = followup_false[0]
+                category = "followup_not_scheduled"
+                evidence = (
+                    f"Afspraak zichtbaar in appointments view ({appt.appointment_type}, {str(appt.start_at)[:10]}) "
+                    f"met followup_scheduled = false — geen vervolgafspraak ingepland."
+                )
+            else:
+                appt = view_rows[0]
+                category = "appointment_in_view_no_followup_required"
+                evidence = (
+                    f"Afspraak zichtbaar in appointments view ({appt.appointment_type}, {str(appt.start_at)[:10]}). "
+                    f"followup_scheduled is null — dit afspraaktype vereist geen vervolgafspraak."
+                )
+
+        elif past:
+            appt = past[0]
+            category = "view_gap"
+            evidence = (
+                f"{len(past)} verleden afspraak(en) in raw_events (status=new, niet geannuleerd) "
+                f"maar niet zichtbaar in appointments view. "
+                f"Recentste: {appt.appt_type} op {str(appt.start_at)[:10] if appt.start_at else '?'}. "
+                f"Mogelijke oorzaak: view-definitie filtert deze afspraken weg."
+            )
+
+        else:
+            category = "unknown"
+            evidence = f"{len(raw_rows)} events in raw_events, maar geen actieve verleden afspraken vastgesteld."
+
+        log({"STAGE_C_RESULT": {"category": category, "evidence": evidence}})
+        return {
+            "category": category,
+            "evidence": evidence,
+            "raw_events_count": len(raw_rows),
+            "view_count": len(view_rows),
+            "future_count": len(future),
+            "past_count": len(past),
+            "error": None
+        }
+
+    except Exception as e:
+        log({"STAGE_C_BIGQUERY_ERROR": str(e)})
+        return {
+            "category": "unknown",
+            "evidence": f"BigQuery-query mislukt: {str(e)[:100]}",
+            "raw_events_count": 0,
+            "view_count": 0,
+            "future_count": 0,
+            "past_count": 0,
+            "error": str(e)
+        }
 
 
 def investigate_discrepancy_appointment(
@@ -1110,49 +1192,75 @@ def investigate_discrepancy_appointment(
             "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": None}
         }
 
-    # ── Stage C: Pipeline log walk ────────────────────────────────────────────
-    created_at_str = appt.get("created_at")
-    try:
-        anchor_time = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
-        if anchor_time.tzinfo is None:
-            anchor_time = anchor_time.replace(tzinfo=timezone.utc)
-    except Exception:
-        anchor_time = datetime.now(timezone.utc) - timedelta(hours=1)
-        log({"STAGE_C_ANCHOR_FALLBACK": {"created_at_str": created_at_str}})
-
-    stage_c = investigate_stage_c_pipeline(
-        str(customer_id) if customer_id else None, email, anchor_time
+    # ── Stage C: BigQuery onderzoek ───────────────────────────────────────────
+    stage_c = investigate_stage_c_bigquery(
+        tenant_id, str(customer_id) if customer_id else None, email
     )
 
-    if stage_c.get("first_missing_stage"):
-        drop_stage = stage_c["first_missing_stage"]
-        category = f"pipeline_drop_{drop_stage.replace('-', '_')}"
-        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": category}})
-        return {
-            "root_cause_category": category,
-            "root_cause": f"Event weggevallen bij pipeline-stage '{drop_stage}'",
-            "confidence": "medium",
-            "evidence": stage_c["evidence"],
-            "needs_dennis_approval": True,
-            "resolution_possible": False,
-            "resolution_method": "escalate",
-            "resolution_description": f"Pipeline drop bij '{drop_stage}' — Dennis onderzoekt de oorzaak en bepaalt replay-strategie",
-            "employee_message": "We zien de afspraak staan in Acuity, maar hebben deze hier niet ontvangen. Melding gemaakt van het probleem.",
-            "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
-        }
+    c_category = stage_c.get("category", "unknown")
+    log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": c_category}})
 
-    # All stages present — event flowed through the full pipeline but task didn't close
-    log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": "unknown", "reason": "all stages present"}})
+    category_map = {
+        "not_in_raw_events": (
+            "not_in_raw_events",
+            "Afspraak niet aangetroffen in BigQuery — webhook of pipeline heeft de afspraak nooit verwerkt.",
+            "medium",
+            "We zien de afspraak staan in Acuity, maar deze is hier niet binnengekomen. Melding gemaakt van het probleem."
+        ),
+        "appointment_cancelled": (
+            "appointment_cancelled_in_pipeline",
+            "Afspraak was geboekt maar is geannuleerd — pipeline heeft een cancel-event verwerkt.",
+            "high",
+            "De afspraak was ingepland maar is inmiddels geannuleerd in het systeem."
+        ),
+        "appointment_future_not_in_view": (
+            "appointment_future_not_in_view",
+            "Afspraak staat in de toekomst en is verwerkt in BigQuery — de appointments view filtert toekomstige afspraken eruit. Taakafsluitingslogica afhankelijk van view heeft dit gemist.",
+            "high",
+            "We zien de afspraak staan — de verwerking is correct, maar de taak is nog niet automatisch gesloten. Melding gemaakt."
+        ),
+        "followup_not_scheduled": (
+            "followup_not_scheduled",
+            "Afspraak zichtbaar in BigQuery, maar geen vervolgafspraak ingepland (followup_scheduled = false).",
+            "high",
+            "We zien de afspraak staan, maar er is nog geen vervolgafspraak ingepland."
+        ),
+        "followup_scheduled_task_not_closed": (
+            "followup_scheduled_task_not_closed",
+            "Vervolgafspraak is ingepland (followup_scheduled = true) maar de taak is niet gesloten — anomalie in task-completion logica.",
+            "medium",
+            "We zien de afspraak staan én er is een vervolgafspraak ingepland, maar de taak is niet automatisch gesloten. Melding gemaakt."
+        ),
+        "appointment_in_view_no_followup_required": (
+            "appointment_in_view_no_followup_required",
+            "Afspraak zichtbaar in BigQuery — dit afspraaktype vereist geen vervolgafspraak. Oorzaak taak onduidelijk.",
+            "low",
+            "We zien de afspraak staan. Melding gemaakt van het probleem."
+        ),
+        "view_gap": (
+            "view_gap",
+            "Afspraak staat in raw_events (verwerkt) maar is niet zichtbaar in de appointments view — view-definitie filtert deze afspraak weg.",
+            "medium",
+            "We zien de afspraak in ons systeem, maar deze wordt niet correct opgepikt door de verwerking. Melding gemaakt van het probleem."
+        ),
+    }
+
+    root_cause_category, root_cause, confidence, employee_message = category_map.get(
+        c_category,
+        ("unknown", "Oorzaak kon niet worden vastgesteld via BigQuery.", "low",
+         "We zien de afspraak staan in Acuity, maar kunnen niet achterhalen waar de verwerking is gestopt. Melding gemaakt van het probleem.")
+    )
+
     return {
-        "root_cause_category": "unknown",
-        "root_cause": "Afspraak aanwezig in Acuity, identiteit consistent, event aanwezig in alle pipeline-stages — anomalie",
-        "confidence": "low",
+        "root_cause_category": root_cause_category,
+        "root_cause": root_cause,
+        "confidence": confidence,
         "evidence": stage_c["evidence"],
         "needs_dennis_approval": True,
         "resolution_possible": False,
         "resolution_method": "escalate",
-        "resolution_description": "Handmatig onderzoek door Dennis — alle systemen tonen de afspraak maar de taak is niet gesloten",
-        "employee_message": "We zien de afspraak staan in Acuity, maar kunnen niet achterhalen waar de verwerking is gestopt. Melding gemaakt van het probleem.",
+        "resolution_description": f"BigQuery-diagnose: {c_category} — Dennis bepaalt vervolgactie.",
+        "employee_message": employee_message,
         "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
     }
 
