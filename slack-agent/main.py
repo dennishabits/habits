@@ -806,6 +806,101 @@ def _service_enabled(tenant: dict, service: str) -> bool:
     return False
 
 
+def verify_acuity_client_email(tenant: dict, email: str) -> dict:
+    """
+    Verifies that a client with the given email exists in Acuity.
+    Used for member_admin tasks where the employee reports an email change.
+    Returns: {"found": bool, "skipped": bool, "error": str | None}
+    """
+    if not _service_enabled(tenant, "acuity"):
+        return {"found": False, "skipped": True, "error": None}
+
+    acuity_config = tenant.get("acuityConfig", {})
+    api_key = acuity_config.get("apiKey")
+    user_id = acuity_config.get("userId")
+
+    if not api_key or not user_id:
+        return {"found": False, "skipped": False, "error": "missing acuity credentials"}
+
+    try:
+        resp = requests.get(
+            "https://acuityscheduling.com/api/v1/clients",
+            auth=(user_id, api_key),
+            params={"email": email.lower()},
+            headers={"Accept": "application/json"},
+            timeout=15
+        )
+        resp.raise_for_status()
+        clients = resp.json()
+        found = len(clients) > 0
+        log({"ACUITY_CLIENT_VERIFY": {"email": email, "found": found, "count": len(clients)}})
+        return {"found": found, "skipped": False, "error": None}
+    except Exception as e:
+        log({"ACUITY_CLIENT_VERIFY_ERROR": {"error": str(e)}})
+        return {"found": False, "skipped": False, "error": str(e)}
+
+
+def investigate_discrepancy_member_admin(tenant: dict, task_data: dict) -> dict:
+    """
+    Verifies a member_admin task by checking Acuity for the task email.
+    If found: auto-resolvable via firestore_direct.
+    If not found or error: escalate.
+    """
+    email = (task_data.get("email") or "").lower()
+    result = verify_acuity_client_email(tenant, email)
+
+    if result.get("skipped"):
+        return {
+            "root_cause_category": "unknown",
+            "root_cause": "Acuity niet geconfigureerd — verificatie overgeslagen.",
+            "confidence": "low",
+            "evidence": "Acuity niet geconfigureerd voor deze tenant.",
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": "Controleer Acuity handmatig.",
+            "employee_message": "We kunnen de wijziging op dit moment niet automatisch controleren. Melding gemaakt.",
+        }
+
+    if result.get("error"):
+        return {
+            "root_cause_category": "unknown",
+            "root_cause": f"Acuity verificatie mislukt: {result['error']}",
+            "confidence": "low",
+            "evidence": result["error"],
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": "Technische fout bij Acuity verificatie.",
+            "employee_message": "Er is een technisch probleem bij het controleren van Acuity. Melding gemaakt.",
+        }
+
+    if result["found"]:
+        return {
+            "root_cause_category": "webhook_delay",
+            "root_cause": f"E-mailadres {email} bevestigd in Acuity — taak kan direct worden afgesloten.",
+            "confidence": "high",
+            "evidence": f"Acuity /clients endpoint bevestigt dat {email} bestaat als client.",
+            "needs_dennis_approval": False,
+            "resolution_possible": True,
+            "resolution_method": "firestore_direct",
+            "resolution_description": "Taak direct voltooien in Firestore — Acuity wijziging geverifieerd.",
+            "employee_message": "Het e-mailadres is bevestigd in Acuity — taak wordt afgesloten.",
+        }
+
+    return {
+        "root_cause_category": "unknown",
+        "root_cause": f"E-mailadres {email} niet gevonden in Acuity.",
+        "confidence": "high",
+        "evidence": f"Acuity /clients endpoint retourneert geen client voor {email}.",
+        "needs_dennis_approval": True,
+        "resolution_possible": False,
+        "resolution_method": "escalate",
+        "resolution_description": "Controleer bij de medewerker of het juiste e-mailadres is gebruikt in Acuity.",
+        "employee_message": "Het e-mailadres staat nog niet in Acuity. Controleer of de wijziging correct is opgeslagen.",
+    }
+
+
 def investigate_stage_a_acuity(tenant: dict, email: str) -> dict:
     if not _service_enabled(tenant, "acuity"):
         log({"STAGE_A_SKIPPED": {"reason": "acuity not enabled"}})
@@ -1477,6 +1572,8 @@ def handle_task_investigation(
 
     investigation_steps = ["firestore"]
 
+    task_type = task_data.get("task_type")
+
     if action_type == "appointment":
         # Staged source-truth-first investigation — no BigQuery query
         investigation_steps.append("acuity_stage_a")
@@ -1488,6 +1585,12 @@ def handle_task_investigation(
             investigation_steps.append("identity_stage_b")
         if sf.get("stage_c") is not None:
             investigation_steps.append("pipeline_stage_c")
+    elif task_type == "member_admin":
+        # Verify email change directly against Acuity /clients endpoint
+        investigation_steps.append("acuity_client_verify")
+        diagnosis = investigate_discrepancy_member_admin(tenant, task_data)
+        events = []
+        staged_findings = None
     else:
         # Non-appointment: existing BigQuery + Gemini path
         events = get_events_for_task(tenant_id, str(customer_id) if customer_id else None, email, created_at_dt)
