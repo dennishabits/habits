@@ -123,6 +123,8 @@ Wanneer needs_dennis_approval TRUE is (escaleer naar Dennis) — gebruik dit als
 - de fix heeft effecten buiten deze taak
 - je twijfelt over de juiste aanpak
 
+Toon voor employee_message: zakelijk en kort. Nooit enthousiast taalgebruik ("Goed nieuws!", uitroeptekens). Als de medewerker bevestigt dat de taak gedaan is: gebruik "Dank voor je bevestiging — taak afgesloten." Als er iets onduidelijk is: "We controleren dit nader." Bij een probleem: één feitelijke zin zonder dramatisering.
+
 Geef een JSON object terug:
 {
   "employee_message": "bericht voor de medewerker (max 2 zinnen, geen jargon)",
@@ -741,9 +743,13 @@ def handle_awaiting_confirmation(
     thread_ts: str,
     user_message: str
 ):
-    """Employee responded to 'De taak is nu correct verwerkt — klopt dit?'"""
+    """Employee responded to confirmation question after task was auto-closed."""
     msg_lower = user_message.lower()
-    affirmative = any(w in msg_lower for w in ["ja", "klopt", "correct", "goed", "ok", "prima", "juist", "yes", "👍"])
+    affirmative = any(w in msg_lower for w in [
+        "ja", "klopt", "correct", "goed", "ok", "prima", "juist", "yes", "👍",
+        "niks mis", "niets mis", "alles goed", "alles klopt", "is goed", "klopt zo",
+        "top", "dank", "oke", "oké"
+    ])
     negative = any(w in msg_lower for w in ["nee", "niet", "fout", "nope", "wrong", "onjuist", "👎"])
 
     now = datetime.now(timezone.utc).isoformat()
@@ -761,6 +767,11 @@ def handle_awaiting_confirmation(
                 "employee_confirmed": True,
                 "resolved_at": now
             })
+        slack_post(
+            token=slack_token, channel=channel_id,
+            text="Dank voor de bevestiging.",
+            thread_ts=thread_ts
+        )
         log({"SESSION_RESOLVED_BY_EMPLOYEE": {"session_doc_id": session_doc_id}})
 
     elif negative:
@@ -772,7 +783,7 @@ def handle_awaiting_confirmation(
         })
         slack_post(
             token=slack_token, channel=channel_id,
-            text="We kijken nogmaals wat er mis is gegaan.",
+            text="We controleren nogmaals.",
             thread_ts=thread_ts
         )
         log({"SESSION_REOPENED": {"session_doc_id": session_doc_id}})
@@ -780,7 +791,7 @@ def handle_awaiting_confirmation(
     else:
         slack_post(
             token=slack_token, channel=channel_id,
-            text="Klopt de verwerking nu, of is er nog iets mis?",
+            text="Is alles correct verlopen?",
             thread_ts=thread_ts
         )
         append_to_session_conversation(session_doc_id, "employee", user_message)
@@ -1554,7 +1565,7 @@ def handle_task_investigation(
 
     slack_post(
         token=slack_token, channel=channel_id,
-        text="We kijken wat er is misgegaan.",
+        text="We controleren even of de verwerking is bijgewerkt.",
         thread_ts=thread_ts
     )
     log({"TO_SLACK_INVESTIGATING": {"thread_ts": thread_ts}})
@@ -1670,7 +1681,7 @@ def handle_task_investigation(
         complete_task(task_doc_id, task_data, slack_token)
         approved_by = "agent"
 
-        confirmation_text = "De taak is nu correct verwerkt — klopt dit?"
+        confirmation_text = "Taak afgesloten — klopt dit?"
         slack_post(
             token=slack_token, channel=channel_id,
             text=confirmation_text,
