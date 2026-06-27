@@ -787,7 +787,7 @@ def handle_awaiting_confirmation(
         log({"SESSION_CONFIRMATION_UNCLEAR": {"session_doc_id": session_doc_id}})
 
 
-# ── STAGED INVESTIGATION (appointment case) ───────────────────────────────────
+# ── STAGED INVESTIGATION ──────────────────────────────────────────────────────
 
 def _service_enabled(tenant: dict, service: str) -> bool:
     """
@@ -840,65 +840,20 @@ def verify_acuity_client_email(tenant: dict, email: str) -> dict:
         return {"found": False, "skipped": False, "error": str(e)}
 
 
-def investigate_discrepancy_member_admin(tenant: dict, task_data: dict) -> dict:
+def _stage_a_for_task(tenant: dict, task_data: dict) -> tuple:
     """
-    Verifies a member_admin task by checking Acuity for the task email.
-    If found: auto-resolvable via firestore_direct.
-    If not found or error: escalate.
+    Returns (stage_a_result, source_label) based on task context,
+    or (None, None) if no source system applies.
     """
+    action_type = task_data.get("action_type")
+    task_type = task_data.get("task_type")
     email = (task_data.get("email") or "").lower()
-    result = verify_acuity_client_email(tenant, email)
 
-    if result.get("skipped"):
-        return {
-            "root_cause_category": "unknown",
-            "root_cause": "Acuity niet geconfigureerd — verificatie overgeslagen.",
-            "confidence": "low",
-            "evidence": "Acuity niet geconfigureerd voor deze tenant.",
-            "needs_dennis_approval": True,
-            "resolution_possible": False,
-            "resolution_method": "escalate",
-            "resolution_description": "Controleer Acuity handmatig.",
-            "employee_message": "We kunnen de wijziging op dit moment niet automatisch controleren. Melding gemaakt.",
-        }
-
-    if result.get("error"):
-        return {
-            "root_cause_category": "unknown",
-            "root_cause": f"Acuity verificatie mislukt: {result['error']}",
-            "confidence": "low",
-            "evidence": result["error"],
-            "needs_dennis_approval": True,
-            "resolution_possible": False,
-            "resolution_method": "escalate",
-            "resolution_description": "Technische fout bij Acuity verificatie.",
-            "employee_message": "Er is een technisch probleem bij het controleren van Acuity. Melding gemaakt.",
-        }
-
-    if result["found"]:
-        return {
-            "root_cause_category": "webhook_delay",
-            "root_cause": f"E-mailadres {email} bevestigd in Acuity — taak kan direct worden afgesloten.",
-            "confidence": "high",
-            "evidence": f"Acuity /clients endpoint bevestigt dat {email} bestaat als client.",
-            "needs_dennis_approval": False,
-            "resolution_possible": True,
-            "resolution_method": "firestore_direct",
-            "resolution_description": "Taak direct voltooien in Firestore — Acuity wijziging geverifieerd.",
-            "employee_message": "Het e-mailadres is bevestigd in Acuity — taak wordt afgesloten.",
-        }
-
-    return {
-        "root_cause_category": "unknown",
-        "root_cause": f"E-mailadres {email} niet gevonden in Acuity.",
-        "confidence": "high",
-        "evidence": f"Acuity /clients endpoint retourneert geen client voor {email}.",
-        "needs_dennis_approval": True,
-        "resolution_possible": False,
-        "resolution_method": "escalate",
-        "resolution_description": "Controleer bij de medewerker of het juiste e-mailadres is gebruikt in Acuity.",
-        "employee_message": "Het e-mailadres staat nog niet in Acuity. Controleer of de wijziging correct is opgeslagen.",
-    }
+    if action_type == "appointment":
+        return investigate_stage_a_acuity(tenant, email), "acuity_appointments"
+    if task_type == "member_admin" and _service_enabled(tenant, "acuity"):
+        return verify_acuity_client_email(tenant, email), "acuity_clients"
+    return None, None
 
 
 def investigate_stage_a_acuity(tenant: dict, email: str) -> dict:
@@ -1215,65 +1170,93 @@ def investigate_stage_c_bigquery(tenant_id: str, customer_id: str, email: str) -
         }
 
 
-def investigate_discrepancy_appointment(
+def investigate_discrepancy_staged(
     tenant_id: str, tenant: dict, task_data: dict, employee_message: str
-) -> dict:
+) -> dict | None:
     """
-    Three-stage source-truth-first investigation for action_type == 'appointment'.
-    Always returns resolution_possible: False and needs_dennis_approval: True (Stage 1).
-    Staged findings are included for the Dennis report and error_log.
+    Universal staged investigation: source system → identity → pipeline.
+    Returns None when no source system applies (caller falls back to BigQuery+Gemini).
     PII rule: no raw API profiles are persisted or passed to Gemini.
     """
+    task_type = task_data.get("task_type")
+    action_type = task_data.get("action_type")
     email = (task_data.get("email") or "").lower()
     customer_id = task_data.get("customer_id")
 
-    log({"APPOINTMENT_INVESTIGATION_START": {
-        "task_type": task_data.get("task_type"),
+    log({"STAGED_INVESTIGATION_START": {
+        "task_type": task_type,
+        "action_type": action_type,
         "customer_id": customer_id,
         "email": email
     }})
 
-    # ── Stage A: Acuity source truth ──────────────────────────────────────────
-    stage_a = investigate_stage_a_acuity(tenant, email)
+    # ── Stage A: Source system ────────────────────────────────────────────────
+    stage_a, source_label = _stage_a_for_task(tenant, task_data)
 
-    if not stage_a.get("found"):
-        if stage_a.get("skipped"):
-            employee_msg = "We kunnen de afspraken niet controleren op dit moment. Melding gemaakt van het probleem."
-            category = "unknown"
-            confidence = "low"
-            root_cause = "Acuity niet geconfigureerd voor deze tenant — Stage A overgeslagen"
-        elif stage_a.get("error"):
-            employee_msg = "Er is een technisch probleem bij het controleren van de afspraak. Melding gemaakt van het probleem."
-            category = "unknown"
-            confidence = "low"
-            root_cause = f"Stage A mislukt door technische fout: {stage_a['error']}"
-        else:
-            employee_msg = "De afspraak staat niet in het systeem onder dit e-mailadres. Mogelijk is die ingepland onder een ander e-mailadres of staat er toch geen afspraak."
-            category = "appointment_not_in_source"
-            confidence = "high"
-            root_cause = f"Geen actieve afspraak gevonden in Acuity voor e-mailadres {email} in het venster −90/+180 dagen"
+    if stage_a is None:
+        log({"STAGED_NO_SOURCE_SYSTEM": {"task_type": task_type, "action_type": action_type}})
+        return None
 
-        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "A", "category": category}})
+    if stage_a.get("skipped"):
+        log({"STAGED_CONCLUDED": {"stage": "A", "reason": "skipped"}})
         return {
-            "root_cause_category": category,
-            "root_cause": root_cause,
-            "confidence": confidence,
-            "evidence": f"Acuity bevraagd voor {email}; {stage_a.get('error') or 'geen actieve afspraken gevonden'}",
+            "root_cause_category": "unknown",
+            "root_cause": f"Bronsysteem ({source_label}) niet geconfigureerd — verificatie overgeslagen.",
+            "confidence": "low",
+            "evidence": f"{source_label} niet geconfigureerd voor deze tenant.",
             "needs_dennis_approval": True,
             "resolution_possible": False,
             "resolution_method": "escalate",
-            "resolution_description": "Controleer bij de medewerker of de afspraak onder een ander e-mailadres staat, of dat er inderdaad geen afspraak is",
+            "resolution_description": "Configureer het bronsysteem of controleer handmatig.",
+            "employee_message": "We kunnen de wijziging op dit moment niet automatisch controleren. Melding gemaakt.",
+            "staged_findings": {"stage_a": stage_a, "stage_b": None, "stage_c": None}
+        }
+
+    if stage_a.get("error"):
+        log({"STAGED_CONCLUDED": {"stage": "A", "reason": "error"}})
+        return {
+            "root_cause_category": "unknown",
+            "root_cause": f"Stage A mislukt door technische fout: {stage_a['error']}",
+            "confidence": "low",
+            "evidence": stage_a["error"],
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": "Technische fout bij bronsysteem verificatie.",
+            "employee_message": "Er is een technisch probleem bij het controleren van het bronsysteem. Melding gemaakt.",
+            "staged_findings": {"stage_a": stage_a, "stage_b": None, "stage_c": None}
+        }
+
+    if not stage_a.get("found"):
+        if action_type == "appointment":
+            employee_msg = "De afspraak staat niet in het systeem onder dit e-mailadres. Mogelijk is die ingepland onder een ander e-mailadres of staat er toch geen afspraak."
+            category = "appointment_not_in_source"
+            root_cause = f"Geen actieve afspraak gevonden in Acuity voor e-mailadres {email} in het venster −90/+180 dagen"
+        else:
+            employee_msg = "De actie staat niet bevestigd in het bronsysteem. Controleer of de wijziging correct is uitgevoerd."
+            category = "action_not_in_source"
+            root_cause = f"Geen bevestiging gevonden in {source_label} voor {email}."
+        log({"STAGED_CONCLUDED": {"stage": "A", "category": category}})
+        return {
+            "root_cause_category": category,
+            "root_cause": root_cause,
+            "confidence": "high",
+            "evidence": f"{source_label} bevraagd voor {email}; actie niet bevestigd.",
+            "needs_dennis_approval": True,
+            "resolution_possible": False,
+            "resolution_method": "escalate",
+            "resolution_description": f"Controleer bij de medewerker of de actie correct is uitgevoerd in {source_label}.",
             "employee_message": employee_msg,
             "staged_findings": {"stage_a": stage_a, "stage_b": None, "stage_c": None}
         }
 
-    appt = stage_a["appointment"]
+    log({"STAGE_A_CONFIRMED": {"source": source_label, "email": email}})
 
-    # ── Stage B: Identity reconciliation ─────────────────────────────────────
+    # ── Stage B: Identity reconciliation ──────────────────────────────────────
     stage_b = investigate_stage_b_identity(tenant, str(customer_id) if customer_id else None, email)
 
     if stage_b.get("mismatch_found"):
-        log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "B", "category": "identity_mismatch"}})
+        log({"STAGED_CONCLUDED": {"stage": "B", "category": "identity_mismatch"}})
         return {
             "root_cause_category": "identity_mismatch",
             "root_cause": f"Identiteitsmismatch: {stage_b['mismatch_description']}",
@@ -1282,25 +1265,41 @@ def investigate_discrepancy_appointment(
             "needs_dennis_approval": True,
             "resolution_possible": False,
             "resolution_method": "escalate",
-            "resolution_description": "Account-merge vereist in Sportivity en/of Customer.io — Dennis beslist over de aanpak",
-            "employee_message": "We zien de afspraak staan in Acuity, maar er lijkt een verschil in gegevens te zitten tussen de systemen. Melding gemaakt van het probleem.",
+            "resolution_description": "Account-merge vereist in Sportivity en/of Customer.io — Dennis beslist over de aanpak.",
+            "employee_message": "We zien de actie in het bronsysteem, maar er lijkt een verschil in gegevens te zitten tussen de systemen. Melding gemaakt.",
             "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": None}
         }
 
-    # ── Stage C: BigQuery onderzoek ───────────────────────────────────────────
-    stage_c = investigate_stage_c_bigquery(
-        tenant_id, str(customer_id) if customer_id else None, email
-    )
-
+    # ── Stage C: Pipeline trace ───────────────────────────────────────────────
+    stage_c = investigate_stage_c_bigquery(tenant_id, str(customer_id) if customer_id else None, email)
     c_category = stage_c.get("category", "unknown")
-    log({"APPOINTMENT_INVESTIGATION_CONCLUDED": {"stage": "C", "category": c_category}})
+    log({"STAGED_CONCLUDED": {"stage": "C", "category": c_category}})
 
+    staged_findings = {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+
+    # member_admin: source confirmation is sufficient to auto-resolve.
+    # Manual Acuity changes don't generate pipeline events — BigQuery silence is expected.
+    if task_type == "member_admin":
+        return {
+            "root_cause_category": "no_pipeline_event_expected",
+            "root_cause": f"Actie bevestigd in {source_label}. Handmatige wijziging genereert geen pipeline event.",
+            "confidence": "high",
+            "evidence": f"{source_label} bevestigt {email}. Pipeline: {stage_c.get('evidence', 'geen events')}.",
+            "needs_dennis_approval": False,
+            "resolution_possible": True,
+            "resolution_method": "firestore_direct",
+            "resolution_description": "Taak direct voltooien — bronsysteem bevestigd.",
+            "employee_message": "De wijziging is bevestigd in het systeem — taak wordt afgesloten.",
+            "staged_findings": staged_findings
+        }
+
+    # For appointment and other tasks: map Stage C category to resolution
     category_map = {
         "not_in_raw_events": (
             "not_in_raw_events",
-            "Afspraak niet aangetroffen in BigQuery — webhook of pipeline heeft de afspraak nooit verwerkt.",
+            "Actie niet aangetroffen in BigQuery — webhook of pipeline heeft de actie nooit verwerkt.",
             "medium",
-            "We zien de afspraak staan in Acuity, maar deze is hier niet binnengekomen. Melding gemaakt van het probleem."
+            "We zien de actie in het bronsysteem, maar deze is hier niet binnengekomen. Melding gemaakt."
         ),
         "appointment_cancelled": (
             "appointment_cancelled_in_pipeline",
@@ -1310,7 +1309,7 @@ def investigate_discrepancy_appointment(
         ),
         "appointment_future_not_in_view": (
             "appointment_future_not_in_view",
-            "Afspraak staat in de toekomst en is verwerkt in BigQuery — de appointments view filtert toekomstige afspraken eruit. Taakafsluitingslogica afhankelijk van view heeft dit gemist.",
+            "Afspraak staat in de toekomst en is verwerkt in BigQuery — de appointments view filtert toekomstige afspraken eruit. Taakafsluitingslogica heeft dit gemist.",
             "high",
             "We zien de afspraak staan — de verwerking is correct, maar de taak is nog niet automatisch gesloten. Melding gemaakt."
         ),
@@ -1336,14 +1335,14 @@ def investigate_discrepancy_appointment(
             "view_gap",
             "Afspraak staat in raw_events (verwerkt) maar is niet zichtbaar in de appointments view — view-definitie filtert deze afspraak weg.",
             "medium",
-            "We zien de afspraak in ons systeem, maar deze wordt niet correct opgepikt door de verwerking. Melding gemaakt van het probleem."
+            "We zien de afspraak in ons systeem, maar deze wordt niet correct opgepikt door de verwerking. Melding gemaakt."
         ),
     }
 
-    root_cause_category, root_cause, confidence, employee_message = category_map.get(
+    root_cause_category, root_cause, confidence, emp_msg = category_map.get(
         c_category,
         ("unknown", "Oorzaak kon niet worden vastgesteld via BigQuery.", "low",
-         "We zien de afspraak staan in Acuity, maar kunnen niet achterhalen waar de verwerking is gestopt. Melding gemaakt van het probleem.")
+         "We zien de actie in het bronsysteem, maar kunnen niet achterhalen waar de verwerking is gestopt. Melding gemaakt.")
     )
 
     return {
@@ -1355,8 +1354,8 @@ def investigate_discrepancy_appointment(
         "resolution_possible": False,
         "resolution_method": "escalate",
         "resolution_description": f"BigQuery-diagnose: {c_category} — Dennis bepaalt vervolgactie.",
-        "employee_message": employee_message,
-        "staged_findings": {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+        "employee_message": emp_msg,
+        "staged_findings": staged_findings
     }
 
 
@@ -1572,27 +1571,23 @@ def handle_task_investigation(
 
     investigation_steps = ["firestore"]
 
-    task_type = task_data.get("task_type")
+    # Always try staged investigation first (source system → identity → pipeline).
+    # Falls back to BigQuery+Gemini when no source system applies.
+    diagnosis = investigate_discrepancy_staged(tenant_id, tenant, task_data, user_message)
 
-    if action_type == "appointment":
-        # Staged source-truth-first investigation — no BigQuery query
-        investigation_steps.append("acuity_stage_a")
-        diagnosis = investigate_discrepancy_appointment(tenant_id, tenant, task_data, user_message)
+    if diagnosis is not None:
         events = []
-        staged_findings = diagnosis.get("staged_findings")
-        sf = staged_findings or {}
-        if sf.get("stage_b") is not None:
+        staged_findings = diagnosis.get("staged_findings") or {}
+        stage_a = staged_findings.get("stage_a")
+        if stage_a and not stage_a.get("skipped"):
+            investigation_steps.append(
+                "acuity_stage_a" if action_type == "appointment" else "acuity_client_verify"
+            )
+        if staged_findings.get("stage_b") is not None:
             investigation_steps.append("identity_stage_b")
-        if sf.get("stage_c") is not None:
+        if staged_findings.get("stage_c") is not None:
             investigation_steps.append("pipeline_stage_c")
-    elif task_type == "member_admin":
-        # Verify email change directly against Acuity /clients endpoint
-        investigation_steps.append("acuity_client_verify")
-        diagnosis = investigate_discrepancy_member_admin(tenant, task_data)
-        events = []
-        staged_findings = None
     else:
-        # Non-appointment: existing BigQuery + Gemini path
         events = get_events_for_task(tenant_id, str(customer_id) if customer_id else None, email, created_at_dt)
         investigation_steps.append("bigquery")
         diagnosis = investigate_discrepancy(task_data, events, user_message)
