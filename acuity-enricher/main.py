@@ -359,8 +359,13 @@ def acuity_enricher(cloud_event):
             print(f"❌ STACK TRACE: {traceback.format_exc()}")
             error_envelope = create_error_envelope(envelope, str(enrichment_error))
             log_json("ERROR_OUTPUT", error_envelope)
-            future = publisher.publish(topic_path, json.dumps(error_envelope).encode("utf-8"))
-            future.result()
+            try:
+                future = publisher.publish(topic_path, json.dumps(error_envelope).encode("utf-8"))
+                future.result()
+            except Exception:
+                pass
+            # Re-raise so Pub/Sub retries this message instead of silently losing it
+            raise enrichment_error
 
     except Exception as e:
         print(f"❌ CRITICAL ERROR: {str(e)}")
