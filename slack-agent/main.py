@@ -8,17 +8,18 @@ from zoneinfo import ZoneInfo
 import requests
 from google.cloud import bigquery, firestore, pubsub_v1
 from google.cloud import logging as gcp_logging
-from google.genai import Client as GenAIClient
+import anthropic
 
 # Clients
 bq_client = bigquery.Client()
 fs_client = firestore.Client()
 publisher = pubsub_v1.PublisherClient()
 logging_client = gcp_logging.Client(project="solid-future-452906-a2")
+anthropic_client = anthropic.Anthropic()
 
 PROJECT_ID = "solid-future-452906-a2"
 DATASET = "gym_analytics"
-GEMINI_MODEL = "gemini-2.5-flash"
+CLAUDE_MODEL = "claude-opus-4-8"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 
 # Pipeline stages walked in Stage C, in order
@@ -486,16 +487,16 @@ def get_events_for_task(tenant_id: str, customer_id: str, email: str, created_at
     return events
 
 
-# ── GEMINI ────────────────────────────────────────────────────────────────────
+# ── CLAUDE ────────────────────────────────────────────────────────────────────
 
-def call_gemini_json(system_prompt: str, user_message: str) -> dict:
-    client = GenAIClient(api_key=os.environ["GEMINI_API_KEY"])
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[{"role": "user", "parts": [{"text": user_message}]}],
-        config={"system_instruction": system_prompt, "response_mime_type": "application/json"}
+def call_claude_json(system_prompt: str, user_message: str) -> dict:
+    response = anthropic_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
     )
-    raw = response.text.strip() if response.text else "{}"
+    raw = response.content[0].text.strip() if response.content else "{}"
     raw = raw.replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(raw)
@@ -507,7 +508,7 @@ def call_gemini_json(system_prompt: str, user_message: str) -> dict:
                 return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-        log({"GEMINI_JSON_PARSE_ERROR": {"raw": raw[:200]}})
+        log({"CLAUDE_JSON_PARSE_ERROR": {"raw": raw[:200]}})
         return {}
 
 
@@ -532,7 +533,7 @@ def classify_message(message: str, conversation: list = None) -> dict:
     if conversation:
         history_lines = [f"{m['role']}: {m['content']}" for m in conversation[-5:]]
         user_content = f"Gespreksgeschiedenis:\n{chr(10).join(history_lines)}\n\nNieuw bericht: {message}"
-    result = call_gemini_json(CLASSIFICATION_PROMPT, user_content)
+    result = call_claude_json(CLASSIFICATION_PROMPT, user_content)
     log({"CLASSIFICATION": result})
     return result
 
@@ -554,7 +555,7 @@ def investigate_discrepancy(task_data: dict, events: list, employee_message: str
         },
         "pipeline_events": events
     }
-    result = call_gemini_json(INVESTIGATION_PROMPT, json.dumps(context, default=str))
+    result = call_claude_json(INVESTIGATION_PROMPT, json.dumps(context, default=str))
     log({"INVESTIGATION_RESULT": result})
     return result
 
@@ -637,7 +638,7 @@ def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_
 
 def extract_followup_date(message: str) -> dict:
     today = datetime.now(AMSTERDAM_TZ).strftime("%Y-%m-%d")
-    result = call_gemini_json(DATE_EXTRACTION_PROMPT, f"Vandaag is {today}.\nBericht: {message}")
+    result = call_claude_json(DATE_EXTRACTION_PROMPT, f"Vandaag is {today}.\nBericht: {message}")
     log({"DATE_EXTRACTION": result})
     return result
 
@@ -647,7 +648,7 @@ def generate_followup_note(conversation: list, user_message: str, followup_reada
     all_messages = employee_messages + ([user_message] if user_message not in employee_messages else [])
     context = "\n".join(f"- {m}" for m in all_messages)
     user_content = f"Follow-up datum: {followup_readable}\n\nBerichten uit de thread:\n{context}"
-    result = call_gemini_json(FOLLOWUP_NOTE_PROMPT, user_content)
+    result = call_claude_json(FOLLOWUP_NOTE_PROMPT, user_content)
     note = result.get("note")
     log({"FOLLOWUP_NOTE_GENERATED": {"note": note}})
     return note or "\n".join(all_messages)
@@ -1304,7 +1305,28 @@ def investigate_discrepancy_staged(
             "staged_findings": staged_findings
         }
 
-    # For appointment and other tasks: map Stage C category to resolution
+    # appointment: if Stage A confirms the appointment exists in Acuity and identity is clean,
+    # auto-resolve regardless of Stage C pipeline category. Pipeline gaps are an internal issue
+    # and don't change the fact that the appointment is real.
+    # Exception: if Stage C shows the appointment was cancelled, escalate — real conflict.
+    if action_type == "appointment" and stage_a.get("found") and c_category != "appointment_cancelled":
+        appt = stage_a.get("appointment", {})
+        appt_date = (appt.get("datetime") or "")[:10]
+        appt_type = appt.get("type", "afspraak")
+        return {
+            "root_cause_category": c_category,
+            "root_cause": f"Afspraak bevestigd in Acuity ({appt_type}, {appt_date}). Pipeline-status: {c_category}.",
+            "confidence": "high",
+            "evidence": f"Acuity bevestigt actieve afspraak ({appt_type} op {appt_date}). {stage_c.get('evidence', '')}",
+            "needs_dennis_approval": False,
+            "resolution_possible": True,
+            "resolution_method": "firestore_direct",
+            "resolution_description": "Taak direct voltooien — afspraak bevestigd in Acuity.",
+            "employee_message": "De afspraak is bevestigd in het systeem — taak wordt afgesloten.",
+            "staged_findings": staged_findings
+        }
+
+    # For other tasks or cancelled appointment: map Stage C category to resolution
     category_map = {
         "not_in_raw_events": (
             "not_in_raw_events",
