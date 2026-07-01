@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+import urllib.parse
 import requests
 import functions_framework
 from datetime import datetime, timezone, timedelta
@@ -74,6 +75,17 @@ def get_known_confirmation_pages(tenant_id, min_date, max_date):
     return {row.confirmation_page for row in rows if row.confirmation_page}
 
 
+def extract_confirmation_page_id(url):
+    if not url:
+        return None
+    try:
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        ids = params.get('id[]', [])
+        return ids[0] if ids else None
+    except Exception:
+        return None
+
+
 def publish_appointment_to_enricher(tenant_id, appointment):
     """Publish a minimal appointment envelope to acuity-enrichments so the enricher processes it."""
     envelope = {
@@ -134,7 +146,8 @@ def acuity_reconciler(request):
 
             missing = [
                 a for a in active
-                if a.get("confirmationPage") and a["confirmationPage"] not in known_pages
+                if (page_id := extract_confirmation_page_id(a.get("confirmationPage")))
+                and page_id not in known_pages
             ]
 
             total_checked += len(active)
