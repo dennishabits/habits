@@ -19,10 +19,41 @@ Habits is een AI-first systeem. Agents die het systeem doorontwikkelen of bedien
 | Type | Functie | Documenten |
 |---|---|---|
 | **Grounding** | Wat is het systeem, voor wie, waarom zo gebouwd | `BUSINESS.md`, `ARCHITECTURE.md` |
-| **Policy** | Hoe opereren agents binnen Habits — beslissingsbevoegdheid, escalatieregels, standaarden | `AGENT.md` *(nog aan te leggen)* |
+| **Policy** | Hoe opereren agents binnen Habits — beslissingsbevoegdheid, escalatieregels, standaarden | `AGENT.md` |
 | **Memory** | Doelen, metingen, wat heeft gewerkt — bijgehouden door de evaluatielaag | `GOALS.md` *(nog aan te leggen)*, BigQuery logs |
 
 Een agent die één van deze drie typen mist heeft een blinde vlek die zich op onverwachte momenten manifesteert.
+
+---
+
+## Agent-architectuur
+
+De agent-laag bestaat uit 2 services en 2 configuratieregistries. Geen code bevat tenant-specifieke logica — tenant-variatie leeft uitsluitend in configuratie.
+
+### Componenten
+
+| Component | Type | Verantwoordelijkheid |
+|---|---|---|
+| **Orchestrator** | Service (huidig: `slack-agent`) | LLM intent-classificatie, process dispatch, read/diagnostisch uitvoering. Geen tenant-logica in code — tenant-context opgelost via `get_tenant_by_team_id` per request. |
+| **Write executor** | Service *(nieuw — zie BACKLOG)* | Schrijfacties met beperkte credentials: `complete_task`, `publish_correction_event` e.d. Pas geïnvoceerd na goedkeuring. Huidige gap: deze acties delen nu een service account met brede read-rechten op Acuity/Sportivity/Customer.io. |
+| **Tool registry** | Firestore config (`tool_registry/{tool_id}`) | Declaratieve definitie per extern systeem: auth-patroon, aangeboden capabilities (`verify_existence`, `fetch_profile`, `apply_action`). Shared definitie; credentials + activering per tenant ongewijzigd in `tenants/{tenant_id}` via bestaande `acuityConfig`, `sportivityToken` etc. |
+| **Process registry** | Firestore config (`process_registry/{process_id}`) | Declaratieve definitie per procestype: stappen, intent, kanaalconfiguratie. Shared definitie; welke processen actief zijn + kanaalconfiguratie per tenant via bestaand `slack_agent_channels` / `get_channel_behavior` patroon. |
+
+**Vuistregel**: type-definitie = shared; credentials / activering / instantie = tenant-geïsoleerd. Geen gedeelde state tussen tenants (zie ADR-0007).
+
+Het schema voor zowel tool registry als process registry wordt afgeleid van de 3 bestaande integraties (Acuity, Sportivity, Customer.io) — niet van een speculatief universeel framework.
+
+### Sequencing
+
+1. **Tool registry generalisatie** vereist eerst dat de 3 bestaande integraties als stabiel contract zijn vastgelegd.
+2. **Stage C** (pipeline trace in de staged investigation) kan pas tool-agnostisch worden als trace-ID-propagatie bestaat — het bevraagt nu hardcoded BigQuery-kolommen per `webhook_source`. Zie Risico's.
+3. **Evaluatielaag** past config/prompts aan op basis van gemeten uitkomsten — schrijft nooit enricher/translator code. Nieuwe tool-onboarding = mens voegt eenmalig een registry-entry toe; diagnose wordt daarna autonoom. Vereist feedbackloop (taak → lid-uitkomst) vóór evaluatielaag, conform bestaande dependency-keten in BACKLOG.md.
+
+### Open beslissing: prompt-scoping
+
+`config/habits_coach_prompt` en `config/team_report_prompt` zijn globaal, niet tenant-gescopet. Dit breekt onder echte multi-tenancy zodra tenants afwijkende toon of prompts willen. Richting: gedeelde default + optionele per-tenant override in `tenants/{tenant_id}`. Nog niet besloten — zie BACKLOG.md.
+
+Zie [ADR-0018](docs/adr/0018-orchestrator-write-executor-tool-process-registry.md) voor de beslissingsrationale.
 
 ---
 
@@ -144,11 +175,15 @@ Wanneer verrijking niet nodig is, publiceert de dispatcher direct naar `{source}
 
 | Collectie | Inhoud |
 |---|---|
-| `tenants` | Slack bot-token, Acuity-configuratie per tenant |
+| `tenants` | Slack bot-token, Acuity-configuratie, `enabledServices` per tenant |
 | `slack_messages` | Opgeslagen Slack-berichten voor deduplicatie en state |
+| `agent_sessions` | Actieve en historische agent-sessies per Slack-thread (`{tenant_id}_{thread_ts}`) |
+| `error_log` | Foutafhandelingslog van de slack-agent — root cause, resolution, bewijs per discrepantie |
 | `coaching_sessions` | Actieve en historische coaching-sessies per manager |
 | `session_locks` | Vergrendelingen tijdens actieve sessies |
-| `config` | Prompt-configuraties (`habits_coach_prompt`, `team_report_prompt` met `management_prompt` en `employee_prompt`) |
+| `config` | Prompt-configuraties (`habits_coach_prompt`, `team_report_prompt`) — huidig globaal; per-tenant override is open beslissing |
+| `tool_registry/{tool_id}` | *(gepland)* Declaratieve tool-definities voor de orchestrator — capabilities, auth-patroon per extern systeem |
+| `process_registry/{process_id}` | *(gepland)* Declaratieve process-definities — stappen, intent, kanaalconfiguratie |
 
 ---
 
@@ -247,6 +282,10 @@ action_type      — bepaalt completion-logica: 'contact', 'appointment', 'subsc
 | Sportivity herprobeert webhooks niet | Bij pipeline-downtime gaat een Sportivity-webhook permanent verloren. DLQ helpt alleen voor berichten die al in Pub/Sub zitten. | Zie BACKLOG.md: *Sportivity reconciliatie-job* |
 | Acuity herprobeert webhooks niet | Zelfde patroon als Sportivity. Bij gemiste Acuity-webhook wordt een afsprakentaak nooit afgesloten. Gedetecteerd op 2026-06-18 via `pipeline_drop_webhook_dispatcher`. De `slack-agent` telt occurrences; bij >5 totaal of ≥2 dagen signaleert de agent actief aan Dennis. | Zie BACKLOG.md: *Acuity reconciliatie-job* |
 | Proliferatie van agent-services | `habits-coach-reply` en `slack-agent` volgen hetzelfde basispatroon in aparte services. Zonder ingreep groeit het aantal agent-services lineair met het aantal processen. | Zie BACKLOG.md: *Eén configureerbare slack-agent* |
+| Hardcoded tool-logica in slack-agent | `_stage_a_for_task`, `investigate_stage_a_acuity`, `investigate_stage_b_identity` en BigQuery-queries met `webhook_source = 'acuity'` zitten inline in de orchestrator. Elke nieuwe tool vereist nu nieuwe Python-branches. Schendt ADR-0009. | Zie BACKLOG.md: *Tool registry + process registry* |
+| Brede credentials in de orchestrator | `complete_task` en `publish_correction_event` draaien nu op hetzelfde service account als de read/diagnostische functies — inclusief brede Acuity/Sportivity/Customer.io-rechten. Write executor scheidt dit. | Zie BACKLOG.md: *Write executor als aparte service* |
+| Prompt-scoping globaal vs. per-tenant | `config/habits_coach_prompt` en `config/team_report_prompt` zijn globaal. Breekt zodra een tenant een afwijkende toon of prompt wil. | Open beslissing — zie BACKLOG.md |
+| `PIPELINE_STAGES` en `_search_stage_logs` mogelijk dead code | Deze symbolen in `slack-agent/main.py` lijken afkomstig van het vroegere log-walking approach, vervangen door `investigate_stage_c_bigquery`. Niet verwijderd zonder verificatie. | Flagged — zie BACKLOG.md |
 | Identiteitsassumpties in de pipeline | De pipeline keyt op `customer_id` of `email`. Bij een klant met meerdere e-mailadressen valt completion-matching stil. Stage 1 detecteert dit; geautomatiseerd herstel ontbreekt nog. | Zie BACKLOG.md: *Integratieagent* |
 
 ---
@@ -263,6 +302,7 @@ Alle architectuurbeslissingen zijn gedocumenteerd als ADRs. Raadpleeg de [ADR-in
 - Zie [ADR-0015](docs/adr/0015-gen2-cloud-functions-standaard-runtime.md) — Gen2 Cloud Functions als standaard runtime
 - Zie [ADR-0016](docs/adr/0016-action-type-op-root-niveau.md) — action_type op root-niveau van CRM task payload
 - Zie [ADR-0017](docs/adr/0017-gemini-google-genai-sdk.md) — Gemini via google-genai SDK, niet Vertex AI
+- Zie [ADR-0018](docs/adr/0018-orchestrator-write-executor-tool-process-registry.md) — Orchestrator + write executor + tool registry + process registry als agent-architectuur
 
 ---
 

@@ -25,6 +25,7 @@ Agents die de rationale achter een beslissing nodig hebben, raadplegen dit index
 | [ADR-0015](0015-gen2-cloud-functions-standaard-runtime.md) | Gen2 Cloud Functions als standaard runtime | Accepted | runtime, gcp |
 | [ADR-0016](0016-action-type-op-root-niveau.md) | action_type op root-niveau van CRM task payload | Accepted | pipeline, schema |
 | [ADR-0017](0017-gemini-google-genai-sdk.md) | Gemini via google-genai SDK, niet Vertex AI | Accepted | ai, gcp, runtime |
+| [ADR-0018](0018-orchestrator-write-executor-tool-process-registry.md) | Orchestrator + write executor + tool registry + process registry | Accepted | architectuur, ai, agent, multi-tenancy |
 
 ## Formaat
 

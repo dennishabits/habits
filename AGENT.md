@@ -178,6 +178,12 @@ De medewerker ziet geen technische details. De agent communiceert in drie stappe
 
 Geen jargon, geen excuses, geen architectuuruitleg.
 
+### Toekomstige generalisatie via tool registry
+
+De staged investigation is nu hardcoded voor Acuity, Sportivity en Customer.io (`_stage_a_for_task`, `investigate_stage_a_acuity`, `investigate_stage_b_identity`). Dit is technische schuld — elke nieuwe tool vereist nieuwe Python-branches, in strijd met ADR-0009. De geplande tool registry (Firestore `tool_registry/{tool_id}`) vervangt deze inline logica door declaratieve capability-definities; de orchestrator leest welke capabilities een tool biedt en roept ze generiek aan. Zie ADR-0018 en BACKLOG.md (*Tool registry + process registry*).
+
+Stage C kan pas tool-agnostisch worden als trace-ID-propagatie bestaat — het bevraagt nu hardcoded `webhook_source`-kolommen in BigQuery.
+
 ### Escalatie bij vastlopen
 
 Als na twee onderzoeksstappen de root cause niet gevonden is, escaleert de agent naar Dennis met:
@@ -343,6 +349,16 @@ gcloud functions logs read [naam] \
   --project=solid-future-452906-a2 \
   --limit=50
 ```
+
+---
+
+## Mogelijke dead code — verificatie vereist
+
+*[Reference]*
+
+`PIPELINE_STAGES` (lijst van servicenamen) en `_search_stage_logs` (Cloud Logging-query per stage) in `slack-agent/main.py` lijken afkomstig van het vroegere log-walking approach, dat is vervangen door `investigate_stage_c_bigquery`. Ze worden niet gebruikt in de huidige staged investigation.
+
+**Actie vereist**: verifieer of deze symbolen nog worden aangeroepen voordat ze worden verwijderd. Verwijdering verloopt via de standaardprocedure: beschrijf wat de code doet, vraag bevestiging, verwijder dan pas. Zie AGENT.md-regel "Code verwijderen".
 
 ---
 
