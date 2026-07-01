@@ -26,6 +26,16 @@ gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 slack_clients = {}
 
 
+def get_model(doc_id: str, fallback: str) -> str:
+    try:
+        doc = firestore_client.collection("config").document(doc_id).get()
+        if doc.exists:
+            return doc.to_dict().get("model", fallback)
+    except Exception as e:
+        log_json("MODEL_FALLBACK", {"doc_id": doc_id, "error": str(e)})
+    return fallback
+
+
 def log_json(label, data):
     print(f"{label}: {json.dumps(data, default=str)}")
 
@@ -389,7 +399,7 @@ def publish_error(error_description, context=None):
 
 def call_gemini(prompt, data_summary):
     full_prompt = f"{prompt}\n\nData:\n{json.dumps(data_summary, ensure_ascii=False, indent=2)}"
-    response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt)
+    response = gemini_client.models.generate_content(model=get_model("team_report_model", "gemini-2.5-flash"), contents=full_prompt)
     return response.text
 
 

@@ -19,7 +19,7 @@ anthropic_client = anthropic.Anthropic()
 
 PROJECT_ID = "solid-future-452906-a2"
 DATASET = "gym_analytics"
-CLAUDE_MODEL = "claude-opus-4-8"
+_DEFAULT_CLAUDE_MODEL = "claude-opus-4-8"
 AMSTERDAM_TZ = ZoneInfo("Europe/Amsterdam")
 
 # Pipeline stages walked in Stage C, in order
@@ -175,6 +175,17 @@ Als er geen datum te extraheren is, geef dan:
   "readable": null
 }
 """
+
+
+def get_model(doc_id: str, fallback: str) -> str:
+    try:
+        doc = fs_client.collection("config").document(doc_id).get()
+        if doc.exists:
+            return doc.to_dict().get("model", fallback)
+    except Exception as e:
+        sys.stdout.write(json.dumps({"MODEL_FALLBACK": {"doc_id": doc_id, "error": str(e)}}) + "\n")
+        sys.stdout.flush()
+    return fallback
 
 
 def get_prompt(doc_id: str, fallback: str = None) -> str:
@@ -509,7 +520,7 @@ def get_events_for_task(tenant_id: str, customer_id: str, email: str, created_at
 
 def call_claude_json(system_prompt: str, user_message: str) -> dict:
     response = anthropic_client.messages.create(
-        model=CLAUDE_MODEL,
+        model=get_model("slack_agent_model", _DEFAULT_CLAUDE_MODEL),
         max_tokens=4096,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],

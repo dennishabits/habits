@@ -13,7 +13,7 @@ fs_client = firestore.Client()
 publisher = pubsub_v1.PublisherClient()
 
 PROJECT_ID = "solid-future-452906-a2"
-GEMINI_MODEL = "gemini-2.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 SERVICE_NAME = "agent-quality-reviewer"
 
 
@@ -219,6 +219,16 @@ Geef ALLEEN een JSON object terug:
 """
 
 
+def get_model(doc_id: str, fallback: str) -> str:
+    try:
+        doc = fs_client.collection("config").document(doc_id).get()
+        if doc.exists:
+            return doc.to_dict().get("model", fallback)
+    except Exception as e:
+        log({"MODEL_FALLBACK": {"doc_id": doc_id, "error": str(e)}})
+    return fallback
+
+
 def synthesize(metrics: dict, comparison: dict | None, gemini_api_key: str) -> dict:
     """Call Gemini to synthesize metrics into proposals."""
     client = GenaiClient(api_key=gemini_api_key)
@@ -229,7 +239,7 @@ def synthesize(metrics: dict, comparison: dict | None, gemini_api_key: str) -> d
     }, indent=2)
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=get_model("agent_quality_reviewer_model", _DEFAULT_GEMINI_MODEL),
         contents=user_content,
         config={
             "system_instruction": SYNTHESIS_PROMPT,

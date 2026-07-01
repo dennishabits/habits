@@ -24,7 +24,7 @@ publisher = pubsub_v1.PublisherClient()
 
 PROJECT_ID = "solid-future-452906-a2"
 DATASET = "gym_analytics"
-GEMINI_MODEL = "gemini-2.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 SESSION_EXPIRY_HOURS = 24
 
 PHASE_ORDER = ["discover", "define", "research", "hmw"]
@@ -118,6 +118,16 @@ class ProgressMessage:
 
 
 # ── FIRESTORE ────────────────────────────────────────────────────────────────
+
+def get_model(doc_id: str, fallback: str) -> str:
+    try:
+        doc = fs_client.collection("config").document(doc_id).get()
+        if doc.exists:
+            return doc.to_dict().get("model", fallback)
+    except Exception as e:
+        log({"MODEL_FALLBACK": {"doc_id": doc_id, "error": str(e)}})
+    return fallback
+
 
 def get_system_prompt() -> str:
     doc = fs_client.collection("config").document("habits_coach_prompt").get()
@@ -802,7 +812,7 @@ def call_gemini(system_prompt: str, messages: list) -> dict:
         gemini_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=get_model("habits_coach_model", _DEFAULT_GEMINI_MODEL),
         contents=gemini_messages,
         config={"system_instruction": system_prompt}
     )
