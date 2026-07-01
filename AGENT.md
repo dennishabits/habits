@@ -233,6 +233,9 @@ Elke foutafhandeling wordt vastgelegd in `error_log/{doc_id}` voor leren en audi
 | `employee_confirmed` | boolean | Heeft de medewerker bevestigd dat het klopt |
 | `staged_findings` | dict \| null | Stage A/B/C resultaten voor appointment-discrepanties — `{stage_a, stage_b, stage_c}`; null voor andere action types |
 | `pipeline_drop_count` | int \| null | Cumulatief aantal `pipeline_drop_*` events voor deze tenant t/m en met dit event; null voor andere categorieën |
+| `reopened` | boolean | `true` als een medewerker na een auto-resolved sessie de taak heropende (negatieve tak `handle_awaiting_confirmation`) |
+| `confidence` | string | Diagnose-confidence: `high`, `medium`, `low` — afkomstig van de LLM-diagnose |
+| `original_error_log_doc_id` | string \| null | Doc-ID van het `error_log`-document dat aan deze heropening voorafging; null bij eerste optreden |
 | `created_at` | timestamp | Moment van signaal |
 | `resolved_at` | timestamp | Moment van afsluiting |
 

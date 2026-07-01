@@ -116,6 +116,7 @@ Wanneer verrijking niet nodig is, publiceert de dispatcher direct naar `{source}
 | `habits-coach-reply` | Slack event | AI-coaching reply op basis van HHI-data en Firestore sessiestate |
 | `habits-coach-weekly` | Cloud Scheduler | Genereert wekelijkse coaching-sessie op basis van HHI-opportunities |
 | `coaching-listener` | `events` topic | Verwerkt coaching-gerelateerde events |
+| `agent-quality-reviewer` | Cloud Scheduler (wekelijks) | Cross-tenant analyse van classificatie- en diagnose-kwaliteit van de slack-agent. Python-aggregatie op `error_log` + `agent_sessions` → Gemini-synthese → voorstel aan Dennis. Schrijft naar `agent_reviews/{doc_id}`. Zie ADR-0019. |
 
 ### Synchronisatie
 
@@ -184,6 +185,7 @@ Wanneer verrijking niet nodig is, publiceert de dispatcher direct naar `{source}
 | `config` | Prompt-configuraties (`habits_coach_prompt`, `team_report_prompt`) — huidig globaal; per-tenant override is open beslissing |
 | `tool_registry/{tool_id}` | *(gepland)* Declaratieve tool-definities voor de orchestrator — capabilities, auth-patroon per extern systeem |
 | `process_registry/{process_id}` | *(gepland)* Declaratieve process-definities — stappen, intent, kanaalconfiguratie |
+| `agent_reviews/{doc_id}` | Wekelijkse kwaliteitsreview-runs van de agent: gedane voorstellen, adoptie-status, recidive-vergelijking t.o.v. vorige run |
 
 ---
 
