@@ -321,6 +321,7 @@ gcloud functions deploy [naam] \
 | `coaching-listener` | `coaching_listener` |
 | `habits-coach-reply` | `habits_coach_reply` |
 | `habits-coach-weekly` | `habits_coach_weekly` |
+| `agent-quality-reviewer` | `agent_quality_reviewer` |
 
 ### Dead-letter queue (events topic)
 
