@@ -794,6 +794,9 @@ def handle_awaiting_confirmation(
         log({"SESSION_RESOLVED_BY_EMPLOYEE": {"session_doc_id": session_doc_id}})
 
     elif negative:
+        error_log_doc_id = session.get("error_log_doc_id")
+        if error_log_doc_id:
+            update_error_log(error_log_doc_id, {"reopened": True})
         update_session(session_doc_id, {
             "status": "investigating",
             "conversation": firestore.ArrayUnion([
@@ -805,7 +808,7 @@ def handle_awaiting_confirmation(
             text="We controleren nogmaals.",
             thread_ts=thread_ts
         )
-        log({"SESSION_REOPENED": {"session_doc_id": session_doc_id}})
+        log({"SESSION_REOPENED": {"session_doc_id": session_doc_id, "previous_error_log_doc_id": error_log_doc_id}})
 
     else:
         slack_post(
@@ -1600,10 +1603,13 @@ def handle_task_investigation(
                 "investigation_steps": [],
                 "root_cause": None,
                 "root_cause_category": None,
+                "confidence": None,
                 "resolution": None,
                 "resolution_method": None,
                 "approved_by": "agent",
                 "employee_confirmed": None,
+                "reopened": False,
+                "original_error_log_doc_id": None,
                 "created_at": now,
                 "resolved_at": now
             })
@@ -1810,10 +1816,13 @@ def handle_task_investigation(
         "investigation_steps": investigation_steps,
         "root_cause": root_cause,
         "root_cause_category": root_cause_category,
+        "confidence": confidence,
         "resolution": resolution,
         "resolution_method": resolution_method,
         "approved_by": approved_by,
         "employee_confirmed": False,
+        "reopened": False,
+        "original_error_log_doc_id": session.get("error_log_doc_id") if session else None,
         "staged_findings": staged_findings,
         "pipeline_drop_count": (pipeline_drop_prev_count + 1) if root_cause_category.startswith("pipeline_drop") else None,
         "created_at": datetime.now(timezone.utc).isoformat(),
