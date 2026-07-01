@@ -31,7 +31,7 @@ PIPELINE_STAGES = [
     "customerio-listener",
 ]
 
-CLASSIFICATION_PROMPT = """
+_DEFAULT_CLASSIFICATION_PROMPT = """
 Je bent een assistent die berichten van sportscholinstructeurs classificeert.
 
 Context: de instructeur reageert in de thread van een openstaande taak. De taak staat nog open in het systeem.
@@ -73,7 +73,7 @@ Geef ALLEEN een JSON object terug, geen andere tekst:
 }
 """
 
-INVESTIGATION_PROMPT = """
+_DEFAULT_INVESTIGATION_PROMPT = """
 Je bent een diagnose-agent voor een gym management systeem. Je onderzoekt discrepanties in taakverwerking.
 
 Je hebt toegang tot:
@@ -142,7 +142,7 @@ Geef een JSON object terug:
 """
 
 
-FOLLOWUP_NOTE_PROMPT = """
+_DEFAULT_FOLLOWUP_NOTE_PROMPT = """
 Je schrijft een korte briefing voor een instructeur die een geplande follow-up taak oppakt.
 
 Je krijgt berichten uit de Slack-thread van de oorspronkelijke taak, plus de datum waarop de follow-up is ingepland.
@@ -154,7 +154,7 @@ Geef ALLEEN een JSON object terug, geen andere tekst:
 """
 
 
-DATE_EXTRACTION_PROMPT = """
+_DEFAULT_DATE_EXTRACTION_PROMPT = """
 Je bent een datum-extractie-assistent. Extraheer een concrete vervolgdatum uit een Nederlands bericht.
 
 Gebruik de meegeleverde huidige datum als referentie voor relatieve uitdrukkingen:
@@ -175,6 +175,24 @@ Als er geen datum te extraheren is, geef dan:
   "readable": null
 }
 """
+
+
+def get_prompt(doc_id: str, fallback: str = None) -> str:
+    try:
+        doc = fs_client.collection("config").document(doc_id).get()
+        if doc.exists:
+            return doc.to_dict().get("prompt", "")
+    except Exception as e:
+        if fallback is not None:
+            sys.stdout.write(json.dumps({"PROMPT_FALLBACK": {"doc_id": doc_id, "error": str(e)}}) + "\n")
+            sys.stdout.flush()
+            return fallback
+        raise
+    if fallback is not None:
+        sys.stdout.write(json.dumps({"PROMPT_NOT_FOUND_FALLBACK": {"doc_id": doc_id}}) + "\n")
+        sys.stdout.flush()
+        return fallback
+    raise ValueError(f"Prompt {doc_id} not found in Firestore config collection")
 
 
 def log(data: dict):
@@ -533,7 +551,7 @@ def classify_message(message: str, conversation: list = None) -> dict:
     if conversation:
         history_lines = [f"{m['role']}: {m['content']}" for m in conversation[-5:]]
         user_content = f"Gespreksgeschiedenis:\n{chr(10).join(history_lines)}\n\nNieuw bericht: {message}"
-    result = call_claude_json(CLASSIFICATION_PROMPT, user_content)
+    result = call_claude_json(get_prompt("slack_classification_prompt", _DEFAULT_CLASSIFICATION_PROMPT), user_content)
     log({"CLASSIFICATION": result})
     return result
 
@@ -555,7 +573,7 @@ def investigate_discrepancy(task_data: dict, events: list, employee_message: str
         },
         "pipeline_events": events
     }
-    result = call_claude_json(INVESTIGATION_PROMPT, json.dumps(context, default=str))
+    result = call_claude_json(get_prompt("slack_investigation_prompt"), json.dumps(context, default=str))
     log({"INVESTIGATION_RESULT": result})
     return result
 
@@ -638,7 +656,7 @@ def publish_task_event(tenant_id: str, task_doc_id: str, task_data: dict, event_
 
 def extract_followup_date(message: str) -> dict:
     today = datetime.now(AMSTERDAM_TZ).strftime("%Y-%m-%d")
-    result = call_claude_json(DATE_EXTRACTION_PROMPT, f"Vandaag is {today}.\nBericht: {message}")
+    result = call_claude_json(get_prompt("slack_date_extraction_prompt"), f"Vandaag is {today}.\nBericht: {message}")
     log({"DATE_EXTRACTION": result})
     return result
 
@@ -648,7 +666,7 @@ def generate_followup_note(conversation: list, user_message: str, followup_reada
     all_messages = employee_messages + ([user_message] if user_message not in employee_messages else [])
     context = "\n".join(f"- {m}" for m in all_messages)
     user_content = f"Follow-up datum: {followup_readable}\n\nBerichten uit de thread:\n{context}"
-    result = call_claude_json(FOLLOWUP_NOTE_PROMPT, user_content)
+    result = call_claude_json(get_prompt("slack_followup_note_prompt"), user_content)
     note = result.get("note")
     log({"FOLLOWUP_NOTE_GENERATED": {"note": note}})
     return note or "\n".join(all_messages)
