@@ -1240,6 +1240,22 @@ def investigate_discrepancy_staged(
         }
 
     if not stage_a.get("found"):
+        # For member_admin tasks the task email is the OLD (wrong) Acuity address.
+        # Not finding it anymore confirms the employee changed it — treat as verified.
+        if task_type == "member_admin":
+            log({"STAGED_CONCLUDED": {"stage": "A", "category": "email_change_confirmed"}})
+            return {
+                "root_cause_category": "no_pipeline_event_expected",
+                "root_cause": "Oud e-mailadres niet meer aangetroffen in Acuity — wijziging bevestigd.",
+                "confidence": "high",
+                "evidence": f"{source_label} bevraagd voor {email}; adres niet gevonden — e-mailwijziging doorgevoerd.",
+                "needs_dennis_approval": False,
+                "resolution_possible": True,
+                "resolution_method": "firestore_direct",
+                "resolution_description": "Taak direct voltooien — e-mailadres is gewijzigd in Acuity.",
+                "employee_message": "De wijziging is bevestigd — taak wordt afgesloten.",
+                "staged_findings": {"stage_a": stage_a, "stage_b": None, "stage_c": None}
+            }
         if action_type == "appointment":
             employee_msg = "De afspraak staat niet in het systeem onder dit e-mailadres. Mogelijk is die ingepland onder een ander e-mailadres of staat er toch geen afspraak."
             category = "appointment_not_in_source"
@@ -1447,6 +1463,16 @@ def handle_task_investigation(
                         task_is_open = True
             if not task_is_open:
                 log({"SESSION_ALREADY_RESOLVED": {"session_doc_id": session_doc_id}})
+                return
+            # Task still open — if Dennis was already informed, log the message and stop.
+            if session.get("error_log_doc_id"):
+                append_to_session_conversation(session_doc_id, "employee", user_message)
+                slack_post(
+                    token=slack_token, channel=channel_id,
+                    text="Bericht ontvangen — dit wordt opgepakt.",
+                    thread_ts=thread_ts
+                )
+                log({"SESSION_DENNIS_ALREADY_INFORMED": {"session_doc_id": session_doc_id}})
                 return
             log({"SESSION_RESOLVED_BUT_TASK_OPEN": {"session_doc_id": session_doc_id, "task_doc_id": task_doc_id_check}})
 
@@ -1719,13 +1745,7 @@ def handle_task_investigation(
             ])
         })
 
-        send_dennis_investigation_report(
-            token=slack_token, dennis_user_id=dennis_user_id,
-            task_doc_id=task_doc_id, user_message=user_message,
-            events=events, diagnosis=diagnosis,
-            resolution_taken=f"✅ Autonoom opgelost — {resolution}",
-            staged_findings=staged_findings
-        )
+        # Auto-resolved — documented in error_log, no report needed.
 
     elif resolution_possible:
         fix_proposal = diagnosis.get("resolution_description") or diagnosis.get("escalation_summary") or root_cause
